@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.2.27"
+version = "1.2.28"
 
 // Keep the ordinary JAR away from the plugin artifact and the release's build/libs/*.jar glob.
 tasks.jar { destinationDirectory.set(layout.buildDirectory.dir("intermediates/jar")) }
@@ -60,10 +60,10 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo.
-        // plugin.json declares apiVersion and minApiVersion 1.0.89, the release that added
-        // AiProviderModels/AiAvailableModel. Those types occur in an override signature, so
-        // a construction-time LinkageError guard cannot make an older host safe: method types
-        // may resolve later and the host can scan constant-pool references before registration.
+        // plugin.json declares 1.0.92, the release assigned to API PR #59. The adapter implements
+        // the new interface and names its types, so a construction-time LinkageError guard cannot
+        // make an older host safe: method types may resolve later and the host can scan constant-
+        // pool references before registration.
         // See AGENTS.md "Linkage containment".
         compileOnly(
             files(
