@@ -77,4 +77,42 @@ class VaultBackupTest {
         val payload = ByteArray(48) { it.toByte() }
         assertContentEquals(payload, VaultCrypto.decrypt(VaultCrypto.encrypt(payload, passphrase), passphrase))
     }
+    @Test
+    fun `unsupported schema is rejected before restore`() {
+        val blob = VaultCrypto.encrypt("{\"schemaVersion\":999,\"entries\":[]}".toByteArray(), passphrase)
+        assertFailsWith<VaultBackupException> { VaultBackupCodec.import(blob, passphrase) }
+    }
+
+    @Test
+    fun `entry limit applies when opening authenticated payloads`() {
+        val data = "{\"entries\":[" + (1..5001).joinToString(",") {
+            "{\"website\":\"s\",\"username\":\"u\",\"password\":\"p\"}"
+        } + "]}"
+        val blob = VaultCrypto.encrypt(data.toByteArray(), passphrase)
+        assertFailsWith<VaultBackupException> { VaultBackupCodec.import(blob, passphrase) }
+    }
+
+    @Test
+    fun `header version cannot be downgraded to bypass authentication`() {
+        val blob = VaultBackupCodec.export(entries, passphrase)
+        blob[7] = 1
+        assertFailsWith<VaultBackupException> { VaultBackupCodec.import(blob, passphrase) }
+    }
+
+    @Test
+    fun `legacy version one backups remain readable`() {
+        val salt = ByteArray(16) { it.toByte() }
+        val iv = ByteArray(12) { (it + 16).toByte() }
+        val spec = javax.crypto.spec.PBEKeySpec(passphrase, salt, 210_000, 256)
+        val bytes = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, javax.crypto.spec.SecretKeySpec(bytes, "AES"),
+            javax.crypto.spec.GCMParameterSpec(128, iv))
+        val ciphertext = cipher.doFinal("{\"schemaVersion\":1,\"entries\":[]}".toByteArray())
+        spec.clearPassword()
+        bytes.fill(0)
+        val blob = "BOSSVLT".toByteArray() + byteArrayOf(1) + salt + iv + ciphertext
+        assertEquals(emptyList(), VaultBackupCodec.import(blob, passphrase))
+    }
+
 }

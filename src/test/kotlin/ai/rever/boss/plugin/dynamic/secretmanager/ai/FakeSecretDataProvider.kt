@@ -5,6 +5,7 @@ import ai.rever.boss.plugin.api.PaginatedSecretsData
 import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingData
 import ai.rever.boss.plugin.api.SecretDataProvider
 import ai.rever.boss.plugin.api.SecretEntryData
+import ai.rever.boss.plugin.api.SecretEntryWithSharingData
 import ai.rever.boss.plugin.api.SecretShareData
 import ai.rever.boss.plugin.api.ShareSecretRequestData
 import ai.rever.boss.plugin.api.UnshareSecretRequestData
@@ -61,7 +62,15 @@ internal class FakeSecretDataProvider(
     override suspend fun getUserSecretsWithSharingInfo(
         limit: Int,
         offset: Int,
-    ): Result<PaginatedSecretsWithSharingData> = Result.failure(UnsupportedOperationException())
+    ): Result<PaginatedSecretsWithSharingData> = getUserSecrets(limit, offset).map { page ->
+        PaginatedSecretsWithSharingData(page.data.map { entry ->
+            SecretEntryWithSharingData(
+                id = entry.id, website = entry.website, username = entry.username, password = entry.password,
+                notes = entry.notes, expirationDate = entry.expirationDate, tags = entry.tags, metadata = entry.metadata,
+                createdAt = entry.createdAt, updatedAt = entry.updatedAt, isOwner = true, accessLevel = "owner",
+            )
+        }, page.hasMore)
+    }
 
     override suspend fun searchSecrets(
         query: String,

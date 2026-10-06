@@ -302,6 +302,7 @@ private fun SecretManagerView(
                         DropdownMenuItem(
                             onClick = {
                                 showAddDropdown = false
+                                onSelectSection(SecretPanelSection.SECRETS)
                                 viewModel.showBackupDialog()
                             }
                         ) {
@@ -607,6 +608,12 @@ private fun SecretsSection(
                 style = SecretPanelType.meta,
                 modifier = Modifier.padding(bottom = 8.dp)
             )
+        }
+        state.backupError?.let { message ->
+            Text(message, color = BossThemeColors.ErrorColor, style = SecretPanelType.meta)
+            TextButton(onClick = { viewModel.showBackupDialog() }) {
+                Text("Try backup / restore again", color = BossThemeColors.AccentColor, style = SecretPanelType.body)
+            }
         }
         state.backupStatus?.let { status ->
             Text(
@@ -1363,17 +1370,20 @@ private fun TagBadge(tag: String) {
 // ==================== DIALOGS ====================
 
 private fun chooseBackupFile(save: Boolean): java.io.File? {
-    val dialog =
-        java.awt.FileDialog(
-            null as java.awt.Frame?,
-            if (save) "Save vault backup" else "Open vault backup",
-            if (save) java.awt.FileDialog.SAVE else java.awt.FileDialog.LOAD
-        )
-    if (save) dialog.file = "boss-vault-backup.bossvlt"
-    dialog.isVisible = true
-    val dir = dialog.directory ?: return null
-    val name = dialog.file ?: return null
-    return java.io.File(dir, name)
+    val dialog = java.awt.FileDialog(
+        null as java.awt.Frame?,
+        if (save) "Save vault backup" else "Open vault backup",
+        if (save) java.awt.FileDialog.SAVE else java.awt.FileDialog.LOAD
+    )
+    return try {
+        if (save) dialog.file = "boss-vault-backup.bossvlt"
+        dialog.isVisible = true
+        val dir = dialog.directory
+        val name = dialog.file
+        if (dir != null && name != null) java.io.File(dir, name) else null
+    } finally {
+        dialog.dispose()
+    }
 }
 
 @Composable
@@ -1384,6 +1394,8 @@ private fun BackupDialog(
     onDismiss: () -> Unit
 ) {
     var passphrase by remember { mutableStateOf("") }
+    var confirmation by remember { mutableStateOf("") }
+    DisposableEffect(Unit) { onDispose { passphrase = ""; confirmation = "" } }
     var showPassword by remember { mutableStateOf(false) }
 
     BossDialog(onDismissRequest = onDismiss) {
@@ -1397,7 +1409,8 @@ private fun BackupDialog(
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     "Export writes an encrypted file only this passphrase can open. " +
-                        "Import adds entries from such a file, skipping ones already present.",
+                        "Import adds entries, skipping exact website and username matches. " +
+                        "Entries with 2FA seeds cannot currently be restored and will be counted separately.",
                     color = BossThemeColors.TextSecondary,
                     style = SecretPanelType.meta
                 )
@@ -1411,6 +1424,18 @@ private fun BackupDialog(
                     showPassword = showPassword,
                     onTogglePassword = { showPassword = !showPassword }
                 )
+                Spacer(modifier = Modifier.height(8.dp))
+                DialogTextField(
+                    value = confirmation,
+                    onValueChange = { confirmation = it },
+                    label = "Confirm passphrase for export",
+                    placeholder = "Repeat the export passphrase",
+                    isPassword = true,
+                    showPassword = showPassword,
+                    onTogglePassword = { showPassword = !showPassword }
+                )
+                Text("Export requires at least 12 characters and a matching confirmation.",
+                    color = BossThemeColors.TextSecondary, style = SecretPanelType.meta)
                 Spacer(modifier = Modifier.height(16.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1425,6 +1450,8 @@ private fun BackupDialog(
                             val file = chooseBackupFile(save = false)
                             if (file != null) {
                                 onImport(file, passphrase.toCharArray())
+                                passphrase = ""
+                                confirmation = ""
                                 onDismiss()
                             }
                         },
@@ -1438,10 +1465,12 @@ private fun BackupDialog(
                             val file = chooseBackupFile(save = true)
                             if (file != null) {
                                 onExport(file, passphrase.toCharArray())
+                                passphrase = ""
+                                confirmation = ""
                                 onDismiss()
                             }
                         },
-                        enabled = !isBusy && passphrase.isNotBlank(),
+                        enabled = !isBusy && passphrase.isNotBlank() && passphrase.length >= 12 && passphrase == confirmation,
                         colors = ButtonDefaults.buttonColors(backgroundColor = BossThemeColors.AccentColor)
                     ) {
                         Text("Export", color = BossThemeColors.TextPrimary)

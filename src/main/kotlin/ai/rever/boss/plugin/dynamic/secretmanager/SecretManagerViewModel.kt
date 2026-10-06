@@ -22,8 +22,10 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultBackupService
+import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultBackupFiles
 import java.io.File
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -68,6 +70,7 @@ class SecretManagerViewModel(
     private var loadJob: Job? = null
     private var searchJob: Job? = null
     private var backupJob: Job? = null
+    private var backupGeneration = 0L
 
     /**
      * The permission collector, which is the only launch here that never completes.
@@ -177,8 +180,12 @@ class SecretManagerViewModel(
         permissionJob = null
         loadJob?.cancel()
         searchJob?.cancel()
+        backupJob?.cancel()
         state = state.copy(
             secrets = emptyList(),
+            showBackupDialog = false,
+            isBackupBusy = false,
+            backupError = null,
             selectedSecret = null,
             secretShares = emptyList(),
             // Closing the panel with the AI-provider dialog open would otherwise leave the
@@ -375,7 +382,8 @@ class SecretManagerViewModel(
     }
 
     fun showBackupDialog() {
-        state = state.copy(showBackupDialog = true, backupStatus = null)
+        if (disposed || state.isBackupBusy) return
+        state = state.copy(showBackupDialog = true, backupStatus = null, backupError = null)
     }
 
     fun hideBackupDialog() {
@@ -387,21 +395,34 @@ class SecretManagerViewModel(
         file: File,
         passphrase: CharArray,
     ) {
-        val provider = secretDataProvider ?: return
-        backupJob?.cancel()
-        state = state.copy(isBackupBusy = true, backupStatus = null, errorMessage = null)
+        val provider = secretDataProvider
+        if (provider == null || disposed || state.isBackupBusy) {
+            passphrase.fill('\u0000')
+            return
+        }
+        val generation = ++backupGeneration
+        state = state.copy(isBackupBusy = true, backupStatus = null, backupError = null)
         backupJob =
             scope.launch {
                 runCatching {
-                    val bytes = VaultBackupService.exportVault(provider, passphrase)
-                    withContext(Dispatchers.IO) { file.writeBytes(bytes) }
+                    withContext(Dispatchers.IO) {
+                        val bytes = VaultBackupService.exportVault(provider, passphrase)
+                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                        val context = kotlinx.coroutines.currentCoroutineContext()
+                        VaultBackupFiles.write(file, bytes) { context.ensureActive() }
+                    }
                 }.onSuccess {
                     if (!disposed) state = state.copy(isBackupBusy = false, backupStatus = "Backup saved to ${file.name}")
                 }.onFailure { error ->
                     if (error is CancellationException) return@onFailure
                     if (!disposed) {
-                        state = state.copy(isBackupBusy = false, errorMessage = error.message ?: "Backup failed")
+                        state = state.copy(isBackupBusy = false, backupError = "Backup failed. Check the destination file and vault access before trying again.")
                     }
+                }
+            }.also { job ->
+                job.invokeOnCompletion {
+                    passphrase.fill('\u0000')
+                    if (!disposed && backupGeneration == generation) state = state.copy(isBackupBusy = false)
                 }
             }
     }
@@ -411,29 +432,42 @@ class SecretManagerViewModel(
         file: File,
         passphrase: CharArray,
     ) {
-        val provider = secretDataProvider ?: return
-        backupJob?.cancel()
-        state = state.copy(isBackupBusy = true, backupStatus = null, errorMessage = null)
+        val provider = secretDataProvider
+        if (provider == null || disposed || state.isBackupBusy) {
+            passphrase.fill('\u0000')
+            return
+        }
+        val generation = ++backupGeneration
+        state = state.copy(isBackupBusy = true, backupStatus = null, backupError = null)
         backupJob =
             scope.launch {
                 runCatching {
-                    val bytes = withContext(Dispatchers.IO) { file.readBytes() }
-                    VaultBackupService.importVault(bytes, passphrase, provider)
+                    withContext(Dispatchers.IO) {
+                        val bytes = VaultBackupFiles.read(file)
+                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                        VaultBackupService.importVault(bytes, passphrase, provider)
+                    }
                 }.onSuccess { outcome ->
                     if (!disposed) {
                         state =
                             state.copy(
                                 isBackupBusy = false,
                                 backupStatus =
-                                    "Restored ${outcome.imported}, skipped ${outcome.skipped}, failed ${outcome.failed}",
+                                    "Restored ${outcome.imported}, skipped ${outcome.skipped}, failed ${outcome.failed}. " +
+                                        "${outcome.unsupportedTwofa} entries with 2FA seeds could not be restored.",
                             )
                         loadSecrets()
                     }
                 }.onFailure { error ->
                     if (error is CancellationException) return@onFailure
                     if (!disposed) {
-                        state = state.copy(isBackupBusy = false, errorMessage = error.message ?: "Restore failed")
+                        state = state.copy(isBackupBusy = false, backupError = "Restore failed. Check the passphrase, backup format and vault access. Some entries may already have been restored.")
                     }
+                }
+            }.also { job ->
+                job.invokeOnCompletion {
+                    passphrase.fill('\u0000')
+                    if (!disposed && backupGeneration == generation) state = state.copy(isBackupBusy = false)
                 }
             }
     }
@@ -1178,6 +1212,7 @@ data class SecretManagerState(
     val lastLoadDurationMs: Long? = null,
     val showBackupDialog: Boolean = false,
     val isBackupBusy: Boolean = false,
+    val backupError: String? = null,
     /** Result line from the last export/restore, or null. */
     val backupStatus: String? = null,
     // Sharing-related state

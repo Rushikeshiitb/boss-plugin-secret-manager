@@ -30,12 +30,16 @@ class VaultBackupException(
 /** The AES-GCM + PBKDF2 envelope, independent of what is inside it. */
 object VaultCrypto {
     private val MAGIC = "BOSSVLT".toByteArray(Charsets.US_ASCII)
-    private const val VERSION: Byte = 1
+    private const val VERSION: Byte = 2
+    private const val LEGACY_VERSION: Byte = 1
     private const val SALT_LEN = 16
     private const val IV_LEN = 12
     private const val TAG_BITS = 128
     private const val KEY_BITS = 256
-    private const val PBKDF2_ITERATIONS = 210_000
+    // OWASP PBKDF2-HMAC-SHA256 guidance: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2
+    private const val PBKDF2_ITERATIONS = 600_000
+    private const val LEGACY_ITERATIONS = 210_000
+    const val MAX_BLOB_BYTES = 64 * 1024 * 1024
     private const val PBKDF2 = "PBKDF2WithHmacSHA256"
     private const val TRANSFORM = "AES/GCM/NoPadding"
 
@@ -47,18 +51,23 @@ object VaultCrypto {
         plaintext: ByteArray,
         passphrase: CharArray,
     ): ByteArray {
+        require(passphrase.isNotEmpty()) { "A backup passphrase is required" }
+        if (plaintext.size > MAX_BLOB_BYTES - minSize) throw VaultBackupException("Backup exceeds the 64 MiB limit")
         val salt = randomBytes(SALT_LEN)
         val iv = randomBytes(IV_LEN)
         val cipher = Cipher.getInstance(TRANSFORM)
-        cipher.init(Cipher.ENCRYPT_MODE, deriveKey(passphrase, salt), GCMParameterSpec(TAG_BITS, iv))
+        cipher.init(Cipher.ENCRYPT_MODE, deriveKey(passphrase, salt, PBKDF2_ITERATIONS), GCMParameterSpec(TAG_BITS, iv))
+        val header = MAGIC + byteArrayOf(VERSION) + salt + iv
+        cipher.updateAAD(header)
         val ciphertext = cipher.doFinal(plaintext)
-        return MAGIC + byteArrayOf(VERSION) + salt + iv + ciphertext
+        return header + ciphertext
     }
 
     fun decrypt(
         blob: ByteArray,
         passphrase: CharArray,
     ): ByteArray {
+        if (blob.size > MAX_BLOB_BYTES) throw VaultBackupException("Backup exceeds the 64 MiB limit")
         if (blob.size < minSize || !hasValidHeader(blob)) {
             throw VaultBackupException("not a BOSS vault backup")
         }
@@ -67,21 +76,26 @@ object VaultCrypto {
         val ciphertext = blob.copyOfRange(headerLen + SALT_LEN + IV_LEN, blob.size)
         return runCatching {
             val cipher = Cipher.getInstance(TRANSFORM)
-            cipher.init(Cipher.DECRYPT_MODE, deriveKey(passphrase, salt), GCMParameterSpec(TAG_BITS, iv))
+            val version = blob[MAGIC.size]
+            val iterations = if (version == LEGACY_VERSION) LEGACY_ITERATIONS else PBKDF2_ITERATIONS
+            cipher.init(Cipher.DECRYPT_MODE, deriveKey(passphrase, salt, iterations), GCMParameterSpec(TAG_BITS, iv))
+            if (version != LEGACY_VERSION) cipher.updateAAD(blob.copyOfRange(0, headerLen + SALT_LEN + IV_LEN))
             cipher.doFinal(ciphertext)
         }.getOrElse { throw VaultBackupException("wrong passphrase or corrupted backup", it) }
     }
 
     private fun hasValidHeader(blob: ByteArray): Boolean =
-        blob.copyOfRange(0, MAGIC.size).contentEquals(MAGIC) && blob[MAGIC.size] == VERSION
+        blob.copyOfRange(0, MAGIC.size).contentEquals(MAGIC) && (blob[MAGIC.size] == VERSION || blob[MAGIC.size] == LEGACY_VERSION)
 
     private fun deriveKey(
         passphrase: CharArray,
         salt: ByteArray,
+        iterations: Int,
     ): SecretKeySpec {
-        val spec = PBEKeySpec(passphrase, salt, PBKDF2_ITERATIONS, KEY_BITS)
+        val spec = PBEKeySpec(passphrase, salt, iterations, KEY_BITS)
         try {
-            return SecretKeySpec(SecretKeyFactory.getInstance(PBKDF2).generateSecret(spec).encoded, "AES")
+            val encoded = SecretKeyFactory.getInstance(PBKDF2).generateSecret(spec).encoded
+            return try { SecretKeySpec(encoded, "AES") } finally { encoded.fill(0) }
         } finally {
             spec.clearPassword()
         }
@@ -127,17 +141,18 @@ data class BackupFile(
 
 /** Serialises the credential list into the encrypted envelope and back. */
 object VaultBackupCodec {
+    const val MAX_ENTRIES = 5000
     private val json = Json { ignoreUnknownKeys = true }
 
     /** Serialise [entries] to JSON and seal them under [passphrase]. */
     fun export(
         entries: List<BackupEntry>,
         passphrase: CharArray,
-    ): ByteArray =
-        VaultCrypto.encrypt(
-            json.encodeToString(BackupFile(entries = entries)).toByteArray(Charsets.UTF_8),
-            passphrase,
-        )
+    ): ByteArray {
+        if (entries.size > MAX_ENTRIES) throw VaultBackupException("Backup exceeds the $MAX_ENTRIES entry limit")
+        val plaintext = json.encodeToString(BackupFile(entries = entries)).toByteArray(Charsets.UTF_8)
+        return try { VaultCrypto.encrypt(plaintext, passphrase) } finally { plaintext.fill(0) }
+    }
 
     /**
      * Open a backup and parse its credentials.
@@ -149,10 +164,19 @@ object VaultBackupCodec {
         blob: ByteArray,
         passphrase: CharArray,
     ): List<BackupEntry> {
-        val plaintext = VaultCrypto.decrypt(blob, passphrase).toString(Charsets.UTF_8)
+        val plaintext = VaultCrypto.decrypt(blob, passphrase)
         val file =
-            runCatching { json.decodeFromString<BackupFile>(plaintext) }
-                .getOrElse { throw VaultBackupException("backup contents are not valid", it) }
+            try {
+                json.decodeFromString<BackupFile>(plaintext.toString(Charsets.UTF_8))
+            } catch (error: Exception) {
+                throw VaultBackupException("Backup contents are not valid", error)
+            } finally {
+                plaintext.fill(0)
+            }
+        if (file.schemaVersion != BackupFile.CURRENT_SCHEMA_VERSION) {
+            throw VaultBackupException("Unsupported backup schema version")
+        }
+        if (file.entries.size > MAX_ENTRIES) throw VaultBackupException("Backup exceeds the $MAX_ENTRIES entry limit")
         return file.entries
     }
 }

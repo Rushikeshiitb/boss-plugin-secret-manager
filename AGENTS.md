@@ -1405,3 +1405,19 @@ broker answers.
 
 Both timings are constructor parameters for the same reason `minBrokeredRefreshIntervalMs` is: a
 test that waits two minutes is a test nobody runs.
+
+## Personal vault tooling
+
+Personal-vault operations must page `getUserSecretsWithSharingInfo` and include only
+`accessLevel == "owner"`. `getUserSecrets` also returns organisation secrets, and an
+organisation creator can carry `isOwner = true`, so neither is a personal-ownership
+predicate. Advance offsets by raw rows, fail on a capped or inconsistent scan, and
+check cancellation after provider returns as well as between pages.
+
+Backup format v2 authenticates the envelope header with AES-GCM and uses
+PBKDF2-HMAC-SHA256 at 600,000 iterations; the reader retains prototype v1 support.
+Reads are bounded at 64 MiB and 5,000 scanned rows/entries. Restore is additive and
+may be partial on write failure or cancellation. The current create/update API
+cannot write a 2FA seed: leave such entries untouched and report `unsupportedTwofa`
+rather than claiming they were restored. Always clear caller-owned passphrase
+arrays on completion, including a launch cancelled before entering its body.

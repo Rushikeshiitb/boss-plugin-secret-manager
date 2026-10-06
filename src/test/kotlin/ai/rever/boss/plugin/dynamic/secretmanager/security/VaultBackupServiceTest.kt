@@ -1,6 +1,11 @@
 package ai.rever.boss.plugin.dynamic.secretmanager.security
 
 import ai.rever.boss.plugin.api.SecretEntryData
+import ai.rever.boss.plugin.api.SecretEntryWithSharingData
+import ai.rever.boss.plugin.api.SecretDataProvider
+import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingData
+import ai.rever.boss.plugin.api.CreateSecretRequestData
+import kotlinx.coroutines.CancellationException
 import ai.rever.boss.plugin.api.SecretMetadataData
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.FakeSecretDataProvider
 import kotlinx.coroutines.test.runTest
@@ -30,7 +35,7 @@ class VaultBackupServiceTest {
     )
 
     @Test
-    fun `export then restore writes every entry into a fresh vault, preserving fields`() =
+    fun `export keeps 2FA seed but restore refuses lossy seeded entries`() =
         runTest {
             val source =
                 FakeSecretDataProvider(
@@ -52,12 +57,11 @@ class VaultBackupServiceTest {
             val dest = FakeSecretDataProvider(emptyList())
             val outcome = VaultBackupService.importVault(blob, passphrase, dest)
 
-            assertEquals(2, outcome.imported)
+            assertEquals(1, outcome.imported)
+            assertEquals(1, outcome.unsupportedTwofa)
+            assertEquals("JBSWY3DPEHPK3PXP", VaultBackupCodec.import(blob, passphrase).first().twofaSecret)
             assertEquals(0, outcome.skipped)
-            val restored = dest.created.first { it.website == "github.com" }
-            assertEquals("hunter2", restored.password)
-            assertEquals(true, restored.twofaEnabled)
-            assertEquals(listOf("r1", "r2"), restored.recoveryCodes)
+            assertEquals(listOf("bank.example"), dest.created.map { it.website })
         }
 
     @Test
@@ -81,4 +85,90 @@ class VaultBackupServiceTest {
             val provider = FakeSecretDataProvider(emptyList(), failReads = true)
             assertFailsWith<IllegalStateException> { VaultBackupService.exportVault(provider, passphrase) }
         }
+    @Test
+    fun `export over limit fails instead of writing partial backup`() = runTest {
+        val provider = FakeSecretDataProvider((1..5001).map { secret("$it", "site", "$it", "pw") })
+        assertFailsWith<VaultBackupException> { VaultBackupService.exportVault(provider, passphrase) }
+        assertEquals(50, provider.pageRequests.size)
+    }
+
+    @Test
+    fun `existing vault over limit fails before any restore writes`() = runTest {
+        val blob = VaultBackupCodec.export(listOf(BackupEntry("new", "u", "pw")), passphrase)
+        val dest = FakeSecretDataProvider((1..5001).map { secret("$it", "site", "$it", "pw") })
+        assertFailsWith<VaultBackupException> { VaultBackupService.importVault(blob, passphrase, dest) }
+        assertTrue(dest.created.isEmpty())
+    }
+
+    @Test
+    fun `case-sensitive usernames and URL paths remain separate entries`() = runTest {
+        val blob = VaultBackupCodec.export(listOf(BackupEntry("site/Path", "User", "pw"),
+            BackupEntry("site/path", "user", "pw")), passphrase)
+        val dest = FakeSecretDataProvider(listOf(secret("1", "site/Path", "user", "old")))
+        val outcome = VaultBackupService.importVault(blob, passphrase, dest)
+        assertEquals(2, outcome.imported)
+    }
+
+    @Test
+    fun `failed writes are counted but cancellation is propagated`() = runTest {
+        val blob = VaultBackupCodec.export(listOf(BackupEntry("site", "u", "pw")), passphrase)
+        val fake = FakeSecretDataProvider(emptyList(), failWrites = true)
+        assertEquals(1, VaultBackupService.importVault(blob, passphrase, fake).failed)
+        val provider = object : SecretDataProvider by fake {
+            override suspend fun createSecret(request: CreateSecretRequestData): Result<Unit> =
+                Result.failure(CancellationException("cancelled"))
+        }
+        assertFailsWith<CancellationException> { VaultBackupService.importVault(blob, passphrase, provider) }
+    }
+
+    @Test
+    fun `an inconsistent empty page fails before import creates anything`() = runTest {
+        val blob = VaultBackupCodec.export(listOf(BackupEntry("site", "u", "pw")), passphrase)
+        val fake = FakeSecretDataProvider(emptyList())
+        val provider = object : SecretDataProvider by fake {
+            override suspend fun getUserSecretsWithSharingInfo(limit: Int, offset: Int) =
+                Result.success(PaginatedSecretsWithSharingData(emptyList(), true))
+        }
+        assertFailsWith<VaultBackupException> { VaultBackupService.importVault(blob, passphrase, provider) }
+        assertTrue(fake.created.isEmpty())
+    }
+
+    @Test
+    fun `ordinary metadata is preserved on restore and in-file duplicates are skipped`() = runTest {
+        val entry = BackupEntry("site", "u", "pw", notes = "note", expirationDate = "2030-01-01",
+            tags = listOf("work"), twofaEnabled = true, twofaType = "sms", recoveryCodes = listOf("r1"))
+        val blob = VaultBackupCodec.export(listOf(entry, entry), passphrase)
+        val dest = FakeSecretDataProvider(emptyList())
+        val outcome = VaultBackupService.importVault(blob, passphrase, dest)
+        assertEquals(1, outcome.imported)
+        assertEquals(1, outcome.skipped)
+        assertEquals("note", dest.created.single().notes)
+        assertEquals("2030-01-01", dest.created.single().expirationDate)
+        assertEquals(listOf("work"), dest.created.single().tags)
+        assertEquals("sms", dest.created.single().twofaType)
+        assertEquals(listOf("r1"), dest.created.single().recoveryCodes)
+    }
+
+    @Test
+    fun `only personal owner source is included even when org creator isOwner is true`() = runTest {
+        val rows = listOf("owner" to true, "org-creator" to true, "org-colleague" to false,
+            "shared" to false, "unknown" to true).map { (label, owner) ->
+            SecretEntryWithSharingData(id = label, website = label, username = "user", password = "pw",
+                createdAt = "now", updatedAt = "now", isOwner = owner,
+                accessLevel = when (label) { "owner" -> "owner"; "org-creator", "org-colleague" -> "org";
+                    "shared" -> "read"; else -> "new-source" })
+        }
+        val fake = FakeSecretDataProvider(emptyList())
+        val provider = object : SecretDataProvider by fake {
+            override suspend fun getUserSecretsWithSharingInfo(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingData> =
+                Result.success(PaginatedSecretsWithSharingData(rows.drop(offset).take(limit), offset + limit < rows.size))
+        }
+        val blob = VaultBackupService.exportVault(provider, passphrase)
+        assertEquals(listOf("owner"), VaultBackupCodec.import(blob, passphrase).map { it.website })
+        val restored = VaultBackupService.importVault(
+            VaultBackupCodec.export(listOf(BackupEntry("org-creator", "user", "pw")), passphrase),
+            passphrase, provider)
+        assertEquals(1, restored.imported, "an org entry must not hide a personal restore")
+    }
+
 }
