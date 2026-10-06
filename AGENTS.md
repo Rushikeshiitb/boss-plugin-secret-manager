@@ -53,8 +53,9 @@ The `processResources` task automatically syncs the version into `plugin.json` a
 
 ## Two sections, one plugin
 
-The panel is segmented into **Secrets** (own + organisation, full CRUD, `getUserSecrets`) and
-**Shared with me** (read-only, `getUserSecretsWithSharingInfo`). The second half arrived by
+The panel is segmented into **Secrets** (own + organisation, management actions gated by
+the host's explicit `canManage` decision, `getUserSecretsWithAccess`) and
+**Shared with me** (read-only, `getUserSecretsWithSharingAccess`). The second half arrived by
 absorbing the `user-secret-list` plugin, whose "My Secrets" panel sat next to this one in the
 sidebar and listed *everything* the caller could read - including their own secrets, which this
 panel already showed. Two panels, overlapping lists, and the wizard installed the read-only one
@@ -63,15 +64,21 @@ by default and this one not at all.
 Three things about it that are easy to get wrong:
 
 **The partition key is `accessLevel`, never `isOwner`.** `get_user_secrets_with_shared` assigns
-the level per UNION source (`supabase/migrations/20260802000000_secrets_org_ownership.sql:536`):
-`owner` for source 1, `org` for source 4, and the share's own level for sources 2, 3 and 5.
-Source 4 is the trap - it returns `is_owner = (s.user_id = auth.uid())`, so a **colleague's**
-organisation secret arrives with `isOwner = false` while nobody shared it with anyone. Splitting
+`owner` to creator rows, `org` to organisation-member rows, and the share's own level to
+explicit shares. A **colleague's** organisation secret can arrive with `isOwner = false`
+while nobody shared it with anyone. Splitting
 on `isOwner` files it under "Shared with me" and tells the user someone shared it with them.
 `SecretAccess.isShare` also treats an *unrecognised* level as a share, so a source added
 server-side surfaces in the read-only section rather than in the one offering Edit and Delete.
 Mutation-verified: swapping the predicate for `!isOwner` fails *an organisation secret created
 by a colleague is not a share*.
+
+An organisation creator can also have `accessLevel = "owner"` and `isOwner = true`:
+the creator row wins the server's deduplication priority. Those labels distinguish
+the two panel sections, not personal ownership or management permission. Use the
+access envelope's organisation markers for ownership and explicit `canManage` for
+mutations. Personal-only health or backup operations must exclude organisation
+markers and reject owner rows whose ownership metadata cannot be verified.
 
 **The scroll prefetch only fires on a list that actually scrolls, and that is load-bearing.**
 `shouldPrefetchMore` is a pure function with an overflow test (`renderedItemCount >
@@ -1405,6 +1412,15 @@ broker answers.
 
 Both timings are constructor parameters for the same reason `minBrokeredRefreshIntervalMs` is: a
 test that waits two minutes is a test nobody runs.
+
+## Stored authenticator codes
+
+The database's `secret_metadata.valid_twofa_type` constraint and the host's secret
+request validators name an authenticator app `app`, not `totp`. `TotpCode` accepts
+`app` and the compatibility label `totp`, while refusing `sms`, `email`, `hardware`,
+unknown types and counter-based `hotp`. Tests must exercise actual `app` metadata
+through both code generation and the clipboard consumer; a `totp`-only fixture can
+pass while every supported database record fails to display a code.
 
 ## Personal vault tooling
 

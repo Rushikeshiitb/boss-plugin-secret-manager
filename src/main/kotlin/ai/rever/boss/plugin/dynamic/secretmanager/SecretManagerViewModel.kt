@@ -7,6 +7,7 @@ import ai.rever.boss.plugin.dynamic.secretmanager.ai.ProviderRegistry
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.SharedProviderDefinition
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.bossAiDefinitionRequest
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.managedProviderUpdate
+import ai.rever.boss.plugin.dynamic.secretmanager.security.TotpCode
 import ai.rever.boss.plugin.logging.BossLogger
 import ai.rever.boss.plugin.logging.LogCategory
 import androidx.compose.runtime.getValue
@@ -18,13 +19,16 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.withContext
 import ai.rever.boss.plugin.dynamic.secretmanager.security.PersonalVaultOwnershipException
+import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealth
+import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealthScanner
+import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealthScanException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultBackupService
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultBackupFiles
 import java.io.File
@@ -63,7 +67,9 @@ class SecretManagerViewModel(
     /** Opens a provider's key console, same affordance as the AI Providers panel. */
     private val splitViewOperations: SplitViewOperations? = null,
     /** Read-only: decides whether the share dialog offers role targets at all. */
-    private val authDataProvider: AuthDataProvider? = null
+    private val authDataProvider: AuthDataProvider? = null,
+    /** Wall clock for regenerating a TOTP code at the instant of a copy. */
+    private val unixTimeSeconds: () -> Long = { System.currentTimeMillis() / 1000L }
 ) {
     private val logger = BossLogger.forComponent("SecretManager")
 
@@ -72,6 +78,14 @@ class SecretManagerViewModel(
     private var searchJob: Job? = null
     private var backupJob: Job? = null
     private var backupGeneration = 0L
+    private var healthJob: Job? = null
+    private var healthGeneration = 0L
+    private var prepareDefinitionJob: Job? = null
+    private var prepareDefinitionGeneration = 0L
+    // Provider cancellation is best-effort: a transport may catch CancellationException and
+    // still return. Generations ensure only the newest authorization snapshot may mutate state.
+    private var secretsRequestGeneration = 0L
+    private var shareRequestGeneration = 0L
 
     /**
      * The permission collector, which is the only launch here that never completes.
@@ -89,15 +103,10 @@ class SecretManagerViewModel(
      * Set by [dispose]; guards the paths that would refill [SecretManagerState.secrets]
      * afterwards.
      *
-     * Cancelling `permissionJob` is not enough on its own. `createSecret` and `updateSecret`
-     * call `loadSecrets()` on success, and `loadSecrets`' own launch is not even assigned to
-     * `loadJob`, so `dispose`'s cancel cannot reach an in-flight initial load either. Save a
-     * secret - or just open the panel - close it before the round-trip returns, and the
-     * plaintext list comes back on a ViewModel nobody can see: the exact state [dispose]
-     * documents itself as preventing. Hence the flag is checked on entry to [loadSecrets]
-     * and again before **every** state write that sets `secrets` ([loadSecrets],
-     * [searchSecrets], [loadMoreSecrets]) - local to each write, rather than depending on the
-     * host provider returning cancellation by throwing.
+     * Cancelling jobs is not enough on its own. A provider may catch cancellation and return a
+     * Result, and `createSecret` / `updateSecret` can start a replacement load. The disposed flag
+     * and request generations are therefore checked before every state write that carries
+     * decrypted secrets, independent of transport cancellation behaviour.
      *
      * `deleteSecret` needs no guard: it filters the existing list, which [dispose] has already
      * emptied, so it cannot repopulate.
@@ -177,18 +186,29 @@ class SecretManagerViewModel(
      */
     fun dispose() {
         disposed = true
+        secretsRequestGeneration++
+        shareRequestGeneration++
+        prepareDefinitionGeneration++
         permissionJob?.cancel()
         permissionJob = null
         loadJob?.cancel()
         searchJob?.cancel()
         backupJob?.cancel()
+        healthJob?.cancel()
+        prepareDefinitionJob?.cancel()
         state = state.copy(
             secrets = emptyList(),
             showBackupDialog = false,
             isBackupBusy = false,
             backupError = null,
+            secretAccess = emptyMap(),
+            healthReport = null,
+            healthError = null,
+            isCheckingHealth = false,
             selectedSecret = null,
             secretShares = emptyList(),
+            secretShareTargets = emptyMap(),
+            isOperationInProgress = false,
             // Closing the panel with the AI-provider dialog open would otherwise leave the
             // raw key in state; hideAiProviderKeyDialog() clears it for the same reason.
             aiProviderKeyDraft = "",
@@ -227,8 +247,14 @@ class SecretManagerViewModel(
      */
     fun loadSecrets() {
         if (disposed) return
+        val generation = ++secretsRequestGeneration
+        loadJob?.cancel()
+        searchJob?.cancel()
+        searchJob = null
         state = state.copy(
             isLoading = true,
+            // Refresh replaces a paginated load, including its progress state.
+            isLoadingMore = false,
             errorMessage = null,
             searchQuery = "",
             currentOffset = 0,
@@ -236,36 +262,43 @@ class SecretManagerViewModel(
             lastLoadDurationMs = null
         )
 
-        scope.launch {
+        loadJob = scope.launch {
             val startedAt = System.nanoTime()
-            val result = secretDataProvider?.getUserSecrets(limit = state.pageSize, offset = 0)
+            val result = secretDataProvider?.getUserSecretsWithAccess(limit = state.pageSize, offset = 0)
             val elapsedMs = elapsedMsSince(startedAt)
 
             result?.onSuccess { paginatedResult ->
-                val secrets = paginatedResult.data
+                val secrets = paginatedResult.data.map { it.secret }
+                val access = paginatedResult.data.associate { it.secret.id to it.toAccessState() }
                 logTiming("getUserSecrets", elapsedMs, "${secrets.size} secrets")
-                // Re-checked AFTER the round-trip, not only on entry: this launch is not
-                // assigned to loadJob, so dispose()'s cancel never reaches it. The ordinary
-                // timeline - panel opens, initialize() loads, user closes before it returns -
-                // would otherwise put the decrypted list back on a disposed ViewModel.
-                if (disposed) return@onSuccess
+                // Re-check after the round-trip as well as cancelling the job: a provider may
+                // convert cancellation into a returned Result, and an older authorization
+                // snapshot must never replace a newer one.
+                if (disposed || generation != secretsRequestGeneration) return@onSuccess
                 state = state.copy(
                     secrets = secrets,
+                    secretAccess = access,
                     isLoading = false,
                     currentOffset = secrets.size,
                     hasMore = paginatedResult.hasMore,
                     lastLoadDurationMs = elapsedMs
                 )
+                closeManagementDialogsIfAccessRevoked()
                 // Pre-warm the API-key permission check off the critical open
                 // path so the Add menu is populated by the time it's opened
                 checkApiKeyPermission()
             }?.onFailure { exception ->
+                if (exception is CancellationException || disposed || generation != secretsRequestGeneration) {
+                    return@onFailure
+                }
                 val error = exception.message ?: "Unknown error"
                 logTiming("getUserSecrets", elapsedMs, error, failed = true)
                 state = state.copy(
                     isLoading = false,
-                    errorMessage = error
+                    errorMessage = error,
+                    secretAccess = emptyMap(),
                 )
+                closeManagementDialogsIfAccessRevoked()
             }
         }
     }
@@ -281,32 +314,39 @@ class SecretManagerViewModel(
             return
         }
 
+        val generation = ++secretsRequestGeneration
         loadJob?.cancel()
+        val offset = state.currentOffset
         state = state.copy(isLoadingMore = true)
 
         loadJob = scope.launch {
             val startedAt = System.nanoTime()
-            val result = secretDataProvider?.getUserSecrets(
+            val result = secretDataProvider?.getUserSecretsWithAccess(
                 limit = state.pageSize,
-                offset = state.currentOffset
+                offset = offset
             )
             val elapsedMs = elapsedMsSince(startedAt)
 
             result?.onSuccess { paginatedResult ->
-                val newSecrets = paginatedResult.data
-                logTiming("getUserSecrets(offset=${state.currentOffset})", elapsedMs, "${newSecrets.size} secrets")
-                if (disposed) return@onSuccess
+                val newSecrets = paginatedResult.data.map { it.secret }
+                val newAccess = paginatedResult.data.associate { it.secret.id to it.toAccessState() }
+                logTiming("getUserSecrets(offset=$offset)", elapsedMs, "${newSecrets.size} secrets")
+                if (disposed || generation != secretsRequestGeneration) return@onSuccess
                 state = state.copy(
                     secrets = state.secrets + newSecrets,
+                    secretAccess = state.secretAccess + newAccess,
                     isLoadingMore = false,
-                    currentOffset = state.currentOffset + newSecrets.size,
+                    currentOffset = offset + newSecrets.size,
                     hasMore = paginatedResult.hasMore,
                     lastLoadDurationMs = elapsedMs
                 )
+                closeManagementDialogsIfAccessRevoked()
             }?.onFailure { exception ->
-                if (exception is CancellationException) return@onFailure
+                if (exception is CancellationException || disposed || generation != secretsRequestGeneration) {
+                    return@onFailure
+                }
                 val error = exception.message ?: "Unknown error"
-                logTiming("getUserSecrets(offset=${state.currentOffset})", elapsedMs, error, failed = true)
+                logTiming("getUserSecrets(offset=$offset)", elapsedMs, error, failed = true)
                 state = state.copy(
                     isLoadingMore = false,
                     errorMessage = error
@@ -319,6 +359,7 @@ class SecretManagerViewModel(
      * Search secrets by website or username
      */
     fun searchSecrets(query: String) {
+        val generation = ++secretsRequestGeneration
         loadJob?.cancel()
         loadJob = null
         searchJob?.cancel()
@@ -341,35 +382,46 @@ class SecretManagerViewModel(
 
         searchJob = scope.launch {
             val startedAt = System.nanoTime()
-            val result = secretDataProvider?.searchSecrets(query = query, limit = 100, offset = 0)
+            val result = secretDataProvider?.searchSecretsWithAccess(query = query, limit = 100, offset = 0)
             val elapsedMs = elapsedMsSince(startedAt)
 
             result?.onSuccess { paginatedResult ->
-                logTiming("searchSecrets", elapsedMs, "${paginatedResult.data.size} secrets")
+                val secrets = paginatedResult.data.map { it.secret }
+                val access = paginatedResult.data.associate { it.secret.id to it.toAccessState() }
+                logTiming("searchSecrets", elapsedMs, "${secrets.size} secrets")
                 // Same reason as loadSecrets: `?.onFailure { if (exception is
                 // CancellationException) ... }` below is this code conceding the provider can
                 // hand cancellation back as a returned Result rather than throwing at the
                 // suspension point. Where it does, the resumption is not cancelled and there
                 // is no suspension point before this write, so searchJob?.cancel() alone does
                 // not stop the decrypted list landing after dispose.
-                if (disposed) return@onSuccess
+                if (disposed || generation != secretsRequestGeneration) return@onSuccess
                 state = state.copy(
-                    secrets = paginatedResult.data,
+                    secrets = secrets,
+                    // Replace rather than merge: keeping an entry from the previous result can
+                    // retain a now-revoked canManage=true decision for an id returned by neither
+                    // the current search nor its authorization snapshot.
+                    secretAccess = access,
                     isLoading = false,
                     isLoadingMore = false,
                     currentOffset = 0,
                     hasMore = false,
                     lastLoadDurationMs = elapsedMs
                 )
+                closeManagementDialogsIfAccessRevoked()
             }?.onFailure { exception ->
-                if (exception is CancellationException) return@onFailure
+                if (exception is CancellationException || disposed || generation != secretsRequestGeneration) {
+                    return@onFailure
+                }
                 val error = exception.message ?: "Unknown error"
                 logTiming("searchSecrets", elapsedMs, error, failed = true)
                 state = state.copy(
                     isLoading = false,
                     isLoadingMore = false,
-                    errorMessage = error
+                    errorMessage = error,
+                    secretAccess = emptyMap(),
                 )
+                closeManagementDialogsIfAccessRevoked()
             }
         }
     }
@@ -382,6 +434,40 @@ class SecretManagerViewModel(
         state = state.copy(showCreateDialog = false)
     }
 
+    /**
+     * Run a local vault-health check (reused and weak passwords) over the whole
+     * personal vault. Analysis is local; only vault reads use the provider.
+     * Cancels any in-flight check first.
+     */
+    fun runVaultHealthCheck() {
+        if (disposed) return
+        val provider = secretDataProvider ?: return
+        val generation = ++healthGeneration
+        healthJob?.cancel()
+        state = state.copy(isCheckingHealth = true, healthReport = null, healthError = null)
+        healthJob =
+            scope.launch {
+                val thisJob = kotlin.coroutines.coroutineContext[Job]
+                runCatching { VaultHealthScanner.scan(provider) }
+                    .onSuccess { report ->
+                        if (!disposed && thisJob?.isActive == true) state = state.copy(healthReport = report, isCheckingHealth = false)
+                    }.onFailure { error ->
+                        if (error is CancellationException) return@onFailure
+                        if (!disposed && thisJob?.isActive == true) {
+                            state =
+                                state.copy(
+                                    isCheckingHealth = false,
+                                    healthError = "Vault health check failed. ${if (error is VaultHealthScanException || error is PersonalVaultOwnershipException) error.message else "Try again."}",
+                                )
+                        }
+                    }
+            }.also { job ->
+                job.invokeOnCompletion {
+                    if (!disposed && healthGeneration == generation) state = state.copy(isCheckingHealth = false)
+                }
+            }
+    }
+
     fun showBackupDialog() {
         if (disposed || state.isBackupBusy) return
         state = state.copy(showBackupDialog = true, backupStatus = null, backupError = null)
@@ -391,7 +477,7 @@ class SecretManagerViewModel(
         state = state.copy(showBackupDialog = false)
     }
 
-    /** Export the whole vault to an encrypted file only [passphrase] can open. */
+    /** Export verified personal-owned secrets to a file only [passphrase] can open. */
     fun exportVaultToFile(
         file: File,
         passphrase: CharArray,
@@ -474,6 +560,7 @@ class SecretManagerViewModel(
     }
 
     fun showEditDialog(secret: SecretEntryData) {
+        if (refuseUnmanaged(secret.id, "edit")) return
         state = state.copy(showEditDialog = true, selectedSecret = secret)
     }
 
@@ -482,6 +569,7 @@ class SecretManagerViewModel(
     }
 
     fun showDeleteDialog(secret: SecretEntryData) {
+        if (refuseUnmanaged(secret.id, "delete")) return
         state = state.copy(showDeleteDialog = true, selectedSecret = secret)
     }
 
@@ -606,11 +694,18 @@ class SecretManagerViewModel(
      * the resulting card so the existing permission-checked share dialog owns targets.
      */
     fun prepareBossAiProviderDefinition() {
+        if (disposed) return
         val provider = secretDataProvider ?: return
+        val generation = ++prepareDefinitionGeneration
+        prepareDefinitionJob?.cancel()
         state = state.copy(isOperationInProgress = true, errorMessage = null)
-        scope.launch {
-            val candidates = provider.searchSecrets(SharedProviderDefinition.BOSS_AI_WEBSITE, limit = 50)
+        prepareDefinitionJob = scope.launch {
+            val result = provider.searchSecretsWithAccess(SharedProviderDefinition.BOSS_AI_WEBSITE, limit = 50)
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (disposed || generation != prepareDefinitionGeneration) return@launch
+            val candidates = result
                 .getOrElse { error ->
+                    if (error is CancellationException) throw error
                     state = state.copy(
                         isOperationInProgress = false,
                         errorMessage = error.message ?: "Could not look for an existing BOSS AI definition.",
@@ -619,8 +714,8 @@ class SecretManagerViewModel(
                 }
                 .data
                 .filter {
-                    it.website == SharedProviderDefinition.BOSS_AI_WEBSITE &&
-                        it.username == SharedProviderDefinition.BOSS_AI_USERNAME
+                    it.secret.website == SharedProviderDefinition.BOSS_AI_WEBSITE &&
+                        it.secret.username == SharedProviderDefinition.BOSS_AI_USERNAME
                 }
 
             if (candidates.size > 1) {
@@ -631,13 +726,25 @@ class SecretManagerViewModel(
                 return@launch
             }
 
+            // This fresh search may find an organisation entry absent from the current UI
+            // page. Its explicit server decision, not the UI cache or creator id, authorizes
+            // upgrading that existing definition. Legacy/default metadata fails closed.
             val write = candidates.singleOrNull()?.let { existing ->
-                managedProviderUpdate(existing).fold(
+                if (!existing.canManage) {
+                    state = state.copy(
+                        isOperationInProgress = false,
+                        errorMessage = "You cannot manage the existing BOSS AI definition.",
+                    )
+                    return@launch
+                }
+                managedProviderUpdate(existing.secret).fold(
                     onSuccess = { provider.updateSecret(it) },
                     onFailure = { Result.failure(it) },
                 )
             } ?: provider.createSecret(bossAiDefinitionRequest())
 
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (disposed || generation != prepareDefinitionGeneration) return@launch
             write.onSuccess {
                 aiProviderStore?.invalidate()
                 state = state.copy(isOperationInProgress = false, errorMessage = null)
@@ -647,6 +754,12 @@ class SecretManagerViewModel(
                     isOperationInProgress = false,
                     errorMessage = error.message ?: "Could not prepare the BOSS AI definition.",
                 )
+            }
+        }.also { job ->
+            job.invokeOnCompletion {
+                if (!disposed && generation == prepareDefinitionGeneration) {
+                    state = state.copy(isOperationInProgress = false)
+                }
             }
         }
     }
@@ -677,10 +790,12 @@ class SecretManagerViewModel(
     }
 
     fun showShareDialog(secret: SecretEntryData) {
+        if (refuseUnmanaged(secret.id, "share")) return
         state = state.copy(
             showShareDialog = true,
             selectedSecret = secret,
             secretShares = emptyList(),
+            secretShareTargets = emptyMap(),
             isLoadingShares = false
         )
         loadSecretShares(secret.id)
@@ -701,10 +816,12 @@ class SecretManagerViewModel(
     }
 
     fun hideShareDialog() {
+        shareRequestGeneration++
         state = state.copy(
             showShareDialog = false,
             selectedSecret = null,
             secretShares = emptyList(),
+            secretShareTargets = emptyMap(),
             isLoadingShares = false
         )
     }
@@ -739,6 +856,7 @@ class SecretManagerViewModel(
      * Update an existing secret
      */
     fun updateSecret(request: UpdateSecretRequestData) {
+        if (refuseUnmanaged(request.secretId, "update")) return
         state = state.copy(isOperationInProgress = true)
 
         scope.launch {
@@ -765,6 +883,7 @@ class SecretManagerViewModel(
      * Delete a secret
      */
     fun deleteSecret(secretId: String) {
+        if (refuseUnmanaged(secretId, "delete")) return
         state = state.copy(isOperationInProgress = true)
 
         scope.launch {
@@ -777,7 +896,10 @@ class SecretManagerViewModel(
             result?.onSuccess {
                 state = state.copy(isOperationInProgress = false)
                 hideDeleteDialog()
-                state = state.copy(secrets = state.secrets.filter { it.id != secretId })
+                state = state.copy(
+                    secrets = state.secrets.filter { it.id != secretId },
+                    secretAccess = state.secretAccess - secretId,
+                )
             }?.onFailure { exception ->
                 state = state.copy(
                     isOperationInProgress = false,
@@ -815,6 +937,29 @@ class SecretManagerViewModel(
         }
     }
 
+    /**
+     * Copy the CURRENT authenticator code for a stored TOTP seed, generated at copy time
+     * from [TotpCode], then wiped from the clipboard on the same policy as a password.
+     *
+     * The code is generated fresh here rather than taken from what the row shows, so a copy
+     * always lands on the code that is live at the instant of the click - the row ticks each
+     * second and the two could otherwise disagree across a rollover. Returns false and copies
+     * nothing when the entry has no usable TOTP seed, so a caller only offers this where it
+     * applies.
+     */
+    fun copyTotpCodeToClipboard(secret: SecretEntryData, clipboard: ClipboardManager): Boolean {
+        val copied = TotpCode.reading(secret.metadata, unixTimeSeconds())?.code ?: return false
+        val generation = ++clipboardCopyGeneration
+        clipboard.setText(AnnotatedString(copied))
+        scope.launch {
+            delay(CLIPBOARD_CLEAR_DELAY_MS)
+            if (generation == clipboardCopyGeneration && clipboard.getText()?.text == copied) {
+                clipboard.setText(AnnotatedString(""))
+            }
+        }
+        return true
+    }
+
     fun togglePasswordVisibility(secretId: String) {
         val current = state.visiblePasswordIds
         state = if (current.contains(secretId)) {
@@ -841,17 +986,74 @@ class SecretManagerViewModel(
         state = state.copy(errorMessage = null)
     }
 
+    /** Server-published access for a row; an absent decision is always read-only. */
+    fun accessFor(secretId: String): SecretAccessState =
+        state.secretAccess[secretId] ?: SecretAccessState.READ_ONLY
+
+    /** The single policy check used by both rendering and every mutation entry point. */
+    fun canManageSecret(secretId: String): Boolean = accessFor(secretId).canManage
+
+    private fun refuseUnmanaged(secretId: String, operation: String): Boolean {
+        if (canManageSecret(secretId)) return false
+        logger.warn(
+            LogCategory.SYSTEM,
+            "Refusing $operation for secret without server-authoritative management access",
+            mapOf("secretId" to secretId),
+        )
+        return true
+    }
+
+    private fun closeManagementDialogsIfAccessRevoked() {
+        val selectedId = state.selectedSecret?.id ?: return
+        if (canManageSecret(selectedId)) return
+        shareRequestGeneration++
+        state = state.copy(
+            showEditDialog = false,
+            showDeleteDialog = false,
+            showShareDialog = false,
+            selectedSecret = null,
+            secretShares = emptyList(),
+            secretShareTargets = emptyMap(),
+            isLoadingShares = false,
+        )
+    }
+
     fun loadSecretShares(secretId: String) {
+        // A mutation can finish after its dialog closed or another secret was opened.
+        // It must not invalidate that dialog's request or leave an orphaned spinner.
+        if (disposed || !state.showShareDialog || state.selectedSecret?.id != secretId ||
+            !canManageSecret(secretId)
+        ) return
+        val generation = ++shareRequestGeneration
         state = state.copy(isLoadingShares = true)
 
         scope.launch {
             val startedAt = System.nanoTime()
-            val result = secretDataProvider?.getSecretShares(secretId)
+            val result = secretDataProvider?.getSecretSharesWithTargets(secretId)
 
-            result?.onSuccess { shares ->
-                logTiming("getSecretShares", elapsedMsSince(startedAt), "${shares.size} shares")
-                state = state.copy(secretShares = shares, isLoadingShares = false)
+            result?.onSuccess { targetedShares ->
+                if (
+                    disposed ||
+                    generation != shareRequestGeneration ||
+                    state.selectedSecret?.id != secretId
+                ) {
+                    return@onSuccess
+                }
+                logTiming("getSecretShares", elapsedMsSince(startedAt), "${targetedShares.size} shares")
+                state = state.copy(
+                    secretShares = targetedShares.map { it.share },
+                    secretShareTargets = targetedShares.associate { target ->
+                        target.share.shareId to SecretShareTargetState(
+                            orgId = target.sharedWithOrgId,
+                            orgSlug = target.sharedWithOrgSlug,
+                        )
+                    },
+                    isLoadingShares = false,
+                )
             }?.onFailure { exception ->
+                if (exception is CancellationException || disposed || generation != shareRequestGeneration) {
+                    return@onFailure
+                }
                 val error = exception.message ?: "Unknown error"
                 logTiming("getSecretShares", elapsedMsSince(startedAt), error, failed = true)
                 state = state.copy(
@@ -863,6 +1065,7 @@ class SecretManagerViewModel(
     }
 
     fun shareSecret(request: ShareSecretRequestData) {
+        if (refuseUnmanaged(request.secretId, "share")) return
         // Defence in depth. `share_secret` refuses an ungranted role target server-side and
         // the dialog is the only caller, but that makes the invariant rest on the UI being
         // the sole entry point. Checked here so it holds for any future caller too.
@@ -894,6 +1097,7 @@ class SecretManagerViewModel(
     }
 
     fun unshareSecret(secretId: String, userId: String? = null, roleId: String? = null) {
+        if (refuseUnmanaged(secretId, "revoke share")) return
         state = state.copy(isOperationInProgress = true)
 
         scope.launch {
@@ -1196,6 +1400,8 @@ class SecretManagerViewModel(
  */
 data class SecretManagerState(
     val secrets: List<SecretEntryData> = emptyList(),
+    /** Per-row server authorization, separated from the binary-stable secret value object. */
+    val secretAccess: Map<String, SecretAccessState> = emptyMap(),
     val isLoading: Boolean = false,
     val isLoadingMore: Boolean = false,
     val isOperationInProgress: Boolean = false,
@@ -1211,6 +1417,10 @@ data class SecretManagerState(
     val currentOffset: Int = 0,
     val hasMore: Boolean = true,
     val lastLoadDurationMs: Long? = null,
+    /** Local vault-health report from the last check, or null if none has run. */
+    val healthReport: VaultHealth.Report? = null,
+    val isCheckingHealth: Boolean = false,
+    val healthError: String? = null,
     val showBackupDialog: Boolean = false,
     val isBackupBusy: Boolean = false,
     val backupError: String? = null,
@@ -1219,6 +1429,7 @@ data class SecretManagerState(
     // Sharing-related state
     val showShareDialog: Boolean = false,
     val secretShares: List<SecretShareData> = emptyList(),
+    val secretShareTargets: Map<String, SecretShareTargetState> = emptyMap(),
     val isLoadingShares: Boolean = false,
     // Available users and roles for sharing
     val availableUsers: List<ShareUserRow> = emptyList(),
@@ -1251,3 +1462,29 @@ data class SecretManagerState(
     /** Where each provider's credential currently comes from, for add-vs-change. */
     val aiProviderSources: Map<String, CredentialSource> = emptyMap()
 )
+
+/** UI-safe projection of the API access envelope. */
+data class SecretAccessState(
+    val orgId: String? = null,
+    val orgSlug: String? = null,
+    val isOrgOwned: Boolean = false,
+    val canManage: Boolean = false,
+) {
+    companion object {
+        val READ_ONLY = SecretAccessState()
+    }
+}
+
+/** Organisation identity carried beside the binary-stable share row. */
+data class SecretShareTargetState(
+    val orgId: String? = null,
+    val orgSlug: String? = null,
+)
+
+private fun SecretEntryWithAccessData.toAccessState(): SecretAccessState =
+    SecretAccessState(
+        orgId = orgId,
+        orgSlug = orgSlug,
+        isOrgOwned = isOrgOwned,
+        canManage = canManage,
+    )

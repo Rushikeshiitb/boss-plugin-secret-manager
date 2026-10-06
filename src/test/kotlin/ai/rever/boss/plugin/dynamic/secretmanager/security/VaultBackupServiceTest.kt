@@ -45,7 +45,7 @@ class VaultBackupServiceTest {
                             "1", "github.com", "john", "hunter2",
                             SecretMetadataData(
                                 twofaEnabled = true,
-                                twofaType = "totp",
+                                twofaType = "app",
                                 twofaSecret = "JBSWY3DPEHPK3PXP",
                                 recoveryCodes = listOf("r1", "r2"),
                             ),

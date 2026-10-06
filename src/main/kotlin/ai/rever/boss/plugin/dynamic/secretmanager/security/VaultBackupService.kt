@@ -8,7 +8,7 @@ import kotlinx.coroutines.CancellationException
 import kotlin.coroutines.coroutineContext
 
 /**
- * Exports the whole vault to an encrypted [VaultBackupCodec] blob and restores it.
+ * Exports verified personal-owned secrets to an encrypted [VaultBackupCodec] blob and restores it.
  *
  * Export pages `getUserSecretsWithSharingAccess` to exhaustion (verified personal owner entries only; organisation markers override owner labels) and captures the
  * FULL fidelity of each entry - notes, expiration, tags, and the 2FA metadata
@@ -34,7 +34,7 @@ object VaultBackupService {
         val unsupportedTwofa: Int = 0,
     )
 
-    /** Enumerate the vault and seal it under [passphrase]. */
+    /** Completely enumerate verified personal-owned secrets and seal them under [passphrase]. */
     suspend fun exportVault(
         provider: SecretDataProvider,
         passphrase: CharArray,
