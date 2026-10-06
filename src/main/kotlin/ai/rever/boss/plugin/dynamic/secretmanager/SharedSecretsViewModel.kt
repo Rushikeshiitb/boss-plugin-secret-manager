@@ -11,6 +11,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -80,6 +81,8 @@ class SharedSecretsViewModel(
     val state: StateFlow<SharedSecretsState> = _state.asStateFlow()
 
     private var loadJob: Job? = null
+    // A transport can swallow cancellation and still return a superseded page.
+    private var loadGeneration = 0L
 
     /**
      * Cancelling is not enough on its own, which is why this exists as well as [loadJob].
@@ -134,10 +137,10 @@ class SharedSecretsViewModel(
                 return
             }
 
+        if (!reset && loadJob?.isActive == true) return
+        val generation = ++loadGeneration
         if (reset) {
             loadJob?.cancel()
-        } else if (loadJob?.isActive == true) {
-            return
         }
 
         _state.update {
@@ -175,6 +178,8 @@ class SharedSecretsViewModel(
                 while (true) {
                     val startedAt = System.nanoTime()
                     val result = provider.getUserSecretsWithSharingAccess(limit = PAGE_SIZE, offset = offset)
+                    kotlin.coroutines.coroutineContext.ensureActive()
+                    if (disposed || generation != loadGeneration) return@launch
                     elapsedMs = elapsedMsSince(startedAt)
 
                     val page =
@@ -182,9 +187,8 @@ class SharedSecretsViewModel(
                             if (error is CancellationException) throw error
                             val message = error.message ?: "Unknown error"
                             logTiming("getUserSecretsWithSharingInfo(offset=$offset)", elapsedMs, message, failed = true)
-                            if (disposed) return@launch
                             _state.update {
-                                it.copy(
+                                if (disposed || generation != loadGeneration) it else it.copy(
                                     isLoading = false,
                                     isLoadingMore = false,
                                     hasLoadedOnce = true,
@@ -224,10 +228,10 @@ class SharedSecretsViewModel(
                     if (!hasMore || shares.isNotEmpty() || pages >= MAX_AUTO_PAGES) break
                 }
 
-                if (disposed) return@launch
+                if (disposed || generation != loadGeneration) return@launch
                 val settled = shares
                 _state.update {
-                    it.copy(
+                    if (disposed || generation != loadGeneration) it else it.copy(
                         allShared = settled,
                         shared = if (it.searchQuery.isBlank()) settled else settled.filterBy(it.searchQuery),
                         secretAccess = access,
@@ -242,6 +246,15 @@ class SharedSecretsViewModel(
                         hasMore = hasMore,
                         lastLoadDurationMs = elapsedMs,
                     )
+                }
+            }.also { job ->
+                // Completion runs even when a cancelled plugin scope never starts the body.
+                // A replaced load must not clear the new load's busy indicators.
+                job.invokeOnCompletion {
+                    _state.update {
+                        if (disposed || generation != loadGeneration) it else
+                            it.copy(isLoading = false, isLoadingMore = false)
+                    }
                 }
             }
     }
@@ -314,6 +327,7 @@ class SharedSecretsViewModel(
      */
     fun dispose() {
         disposed = true
+        loadGeneration++
         loadJob?.cancel()
         loadJob = null
         // Deliberately does NOT touch clipboardCopyGeneration: bumping it here invalidates the
@@ -329,6 +343,8 @@ class SharedSecretsViewModel(
                 shared = emptyList(),
                 secretAccess = emptyMap(),
                 expandedSecretIds = emptySet(),
+                isLoading = false,
+                isLoadingMore = false,
             )
         }
     }
