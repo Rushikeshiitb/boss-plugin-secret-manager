@@ -11,6 +11,7 @@ import ai.rever.boss.plugin.ui.BossAlertDialog
 import ai.rever.boss.plugin.ui.BossBadge
 import ai.rever.boss.plugin.ui.BossCard
 import ai.rever.boss.plugin.ui.BossDialog
+import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealth
 import ai.rever.boss.plugin.ui.BossEmptyState
 import ai.rever.boss.plugin.ui.BossSearchBar
 import ai.rever.boss.plugin.ui.BossTabIndicator
@@ -598,7 +599,7 @@ private fun SecretsSection(
         }
         state.healthReport?.let { report ->
             Text(
-                "Vault health: ${report.reusedPasswordCount} reused, ${report.weakCount} weak " +
+                "Personal vault: ${report.reusedPasswordCount} reused passwords, ${report.weakCount} weak " +
                     "(of ${report.analyzedCount})",
                 color = if (report.hasFindings) BossThemeColors.AccentColor else BossThemeColors.TextSecondary,
                 style = SecretPanelType.meta,
@@ -606,7 +607,19 @@ private fun SecretsSection(
             )
         }
 
-        // Content based on state
+        var showHealthFindings by remember { mutableStateOf(false) }
+    state.healthReport?.let { report ->
+        if (report.hasFindings) {
+            TextButton(onClick = { showHealthFindings = true }) {
+                Text("View findings", color = BossThemeColors.AccentColor, style = SecretPanelType.body)
+            }
+        }
+        if (showHealthFindings) {
+            VaultHealthDialog(report, onDismiss = { showHealthFindings = false })
+        }
+    }
+
+    // Content based on state
         when {
             state.isLoading -> {
                 LoadingView()
@@ -1346,6 +1359,41 @@ private fun TagBadge(tag: String) {
             style = SecretPanelType.caption,
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
         )
+    }
+}
+
+@Composable
+private fun VaultHealthDialog(report: VaultHealth.Report, onDismiss: () -> Unit) {
+    BossDialog(onDismissRequest = onDismiss) {
+        Surface(color = BossThemeColors.SurfaceColor, shape = RoundedCornerShape(8.dp)) {
+            Column(Modifier.width(440.dp).padding(16.dp)) {
+                Text("Vault health findings", color = BossThemeColors.TextPrimary, style = SecretPanelType.title)
+                Text("Local checks for reuse, length and character variety.",
+                    color = BossThemeColors.TextSecondary, style = SecretPanelType.meta)
+                LazyColumn(Modifier.heightIn(max = 400.dp).padding(vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    report.reuseGroups.forEach { group ->
+                        item {
+                            Text("Reused password (${group.count} entries)",
+                                color = BossThemeColors.TextPrimary, style = SecretPanelType.bodyStrong)
+                        }
+                        items(group.members) { member ->
+                            Text("${member.site} · ${member.username}", color = BossThemeColors.TextSecondary, style = SecretPanelType.body)
+                        }
+                    }
+                    items(report.weakEntries) { entry ->
+                        Column {
+                            Text("${entry.site} · ${entry.username}", color = BossThemeColors.TextPrimary, style = SecretPanelType.bodyStrong)
+                            Text(entry.reasons.joinToString("; "),
+                                color = BossThemeColors.TextSecondary, style = SecretPanelType.body)
+                        }
+                    }
+                }
+                TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
+                    Text("Close", color = BossThemeColors.AccentColor)
+                }
+            }
+        }
     }
 }
 

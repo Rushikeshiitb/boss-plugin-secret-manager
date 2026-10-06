@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealth
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealthScanner
+import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealthScanException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -175,8 +176,11 @@ class SecretManagerViewModel(
         permissionJob = null
         loadJob?.cancel()
         searchJob?.cancel()
+        healthJob?.cancel()
         state = state.copy(
             secrets = emptyList(),
+            healthReport = null,
+            isCheckingHealth = false,
             selectedSecret = null,
             secretShares = emptyList(),
             // Closing the panel with the AI-provider dialog open would otherwise leave the
@@ -374,24 +378,27 @@ class SecretManagerViewModel(
 
     /**
      * Run a local vault-health check (reused and weak passwords) over the whole
-     * vault. Offline: no network, no egress. Cancels any in-flight check first.
+     * personal vault. Analysis is local; only vault reads use the provider.
+     * Cancels any in-flight check first.
      */
     fun runVaultHealthCheck() {
+        if (disposed) return
         val provider = secretDataProvider ?: return
         healthJob?.cancel()
-        state = state.copy(isCheckingHealth = true, errorMessage = null)
+        state = state.copy(isCheckingHealth = true, healthReport = null, errorMessage = null)
         healthJob =
             scope.launch {
+                val thisJob = kotlin.coroutines.coroutineContext[Job]
                 runCatching { VaultHealthScanner.scan(provider) }
                     .onSuccess { report ->
-                        if (!disposed) state = state.copy(healthReport = report, isCheckingHealth = false)
+                        if (!disposed && thisJob?.isActive == true) state = state.copy(healthReport = report, isCheckingHealth = false)
                     }.onFailure { error ->
                         if (error is CancellationException) return@onFailure
-                        if (!disposed) {
+                        if (!disposed && thisJob?.isActive == true) {
                             state =
                                 state.copy(
                                     isCheckingHealth = false,
-                                    errorMessage = error.message ?: "Vault health check failed",
+                                    errorMessage = "Vault health check failed. ${if (error is VaultHealthScanException) error.message else "Try again."}",
                                 )
                         }
                     }

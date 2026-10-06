@@ -17,7 +17,10 @@ object VaultHealth {
         val id: String,
         val site: String,
         val password: String,
-    )
+        val username: String = "",
+    ) {
+        override fun toString() = "PasswordRecord(id=$id, site=$site, password=***)"
+    }
 
     enum class Strength { WEAK, FAIR, STRONG }
 
@@ -25,6 +28,7 @@ object VaultHealth {
     data class ReuseMember(
         val id: String,
         val site: String,
+        val username: String = "",
     )
 
     /** A set of accounts that share one password. */
@@ -40,6 +44,7 @@ object VaultHealth {
         val site: String,
         val strength: Strength,
         val reasons: List<String>,
+        val username: String = "",
     )
 
     data class Report(
@@ -66,14 +71,14 @@ object VaultHealth {
                 .groupBy { it.password }
                 .values
                 .filter { it.size > 1 }
-                .map { group -> ReuseGroup(group.map { ReuseMember(it.id, it.site) }) }
+                .map { group -> ReuseGroup(group.map { ReuseMember(it.id, it.site, it.username) }) }
                 .sortedByDescending { it.count }
 
         val weakEntries =
             usable
                 .mapNotNull { record ->
                     val (strength, reasons) = rate(record.password)
-                    if (strength == Strength.STRONG) null else WeakEntry(record.id, record.site, strength, reasons)
+                    if (strength == Strength.STRONG) null else WeakEntry(record.id, record.site, strength, reasons, record.username)
                 }.sortedBy { severity(it.strength) }
 
         return Report(reuseGroups, weakEntries, usable.size)
