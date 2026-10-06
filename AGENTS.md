@@ -1412,3 +1412,25 @@ broker answers.
 
 Both timings are constructor parameters for the same reason `minBrokeredRefreshIntervalMs` is: a
 test that waits two minutes is a test nobody runs.
+
+## Personal vault tooling
+
+Personal-vault operations use the existing API 1.0.92 floor and must page
+`getUserSecretsWithSharingAccess`. The server labels an organisation creator as
+`accessLevel == "owner"` too: source 1 wins the server's priority ordering even
+when `isOrgOwned` is true. Neither `accessLevel` nor `isOwner` alone proves personal
+ownership. Exclude rows with `isOrgOwned`, `orgId` or `orgSlug`; for the remaining
+owner-labelled rows require both `isOwner` and explicit `canManage`. Missing or
+denied owner metadata must fail with an unsupported-ownership error, not silently
+skip rows or analyze/export a partial vault. `sharedWithOrgSlug` alone describes
+a share target and must not exclude a proven personal owner.
+
+The published API's default fallback wraps legacy rows with `canManage = false`;
+it cannot prove ownership. BossConsole #554 is merged and its compatible transport
+is published in [BOSS v9.5.41](https://github.com/risa-labs-inc/BossConsole-Releases/releases/tag/v9.5.41),
+which is the manifest's minimum host version. Its matching runtime companions include
+`boss-ipc` 1.5.0 and `plugin-api-ipc` 1.0.0. A complete,
+empty legacy result is safe to report as zero personal passwords; nonempty
+ambiguous owner results fail closed. Advance offsets by raw rows, fail on capped
+or inconsistent scans, and check cancellation after provider returns as well as
+between pages.
