@@ -18,6 +18,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
@@ -63,6 +64,8 @@ class SecretManagerViewModel(
     // Job tracking to prevent race conditions
     private var loadJob: Job? = null
     private var searchJob: Job? = null
+    private var prepareDefinitionJob: Job? = null
+    private var prepareDefinitionGeneration = 0L
     // Provider cancellation is best-effort: a transport may catch CancellationException and
     // still return. Generations ensure only the newest authorization snapshot may mutate state.
     private var secretsRequestGeneration = 0L
@@ -169,16 +172,19 @@ class SecretManagerViewModel(
         disposed = true
         secretsRequestGeneration++
         shareRequestGeneration++
+        prepareDefinitionGeneration++
         permissionJob?.cancel()
         permissionJob = null
         loadJob?.cancel()
         searchJob?.cancel()
+        prepareDefinitionJob?.cancel()
         state = state.copy(
             secrets = emptyList(),
             secretAccess = emptyMap(),
             selectedSecret = null,
             secretShares = emptyList(),
             secretShareTargets = emptyMap(),
+            isOperationInProgress = false,
             // Closing the panel with the AI-provider dialog open would otherwise leave the
             // raw key in state; hideAiProviderKeyDialog() clears it for the same reason.
             aiProviderKeyDraft = "",
@@ -539,11 +545,18 @@ class SecretManagerViewModel(
      * the resulting card so the existing permission-checked share dialog owns targets.
      */
     fun prepareBossAiProviderDefinition() {
+        if (disposed) return
         val provider = secretDataProvider ?: return
+        val generation = ++prepareDefinitionGeneration
+        prepareDefinitionJob?.cancel()
         state = state.copy(isOperationInProgress = true, errorMessage = null)
-        scope.launch {
-            val candidates = provider.searchSecrets(SharedProviderDefinition.BOSS_AI_WEBSITE, limit = 50)
+        prepareDefinitionJob = scope.launch {
+            val result = provider.searchSecretsWithAccess(SharedProviderDefinition.BOSS_AI_WEBSITE, limit = 50)
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (disposed || generation != prepareDefinitionGeneration) return@launch
+            val candidates = result
                 .getOrElse { error ->
+                    if (error is CancellationException) throw error
                     state = state.copy(
                         isOperationInProgress = false,
                         errorMessage = error.message ?: "Could not look for an existing BOSS AI definition.",
@@ -552,8 +565,8 @@ class SecretManagerViewModel(
                 }
                 .data
                 .filter {
-                    it.website == SharedProviderDefinition.BOSS_AI_WEBSITE &&
-                        it.username == SharedProviderDefinition.BOSS_AI_USERNAME
+                    it.secret.website == SharedProviderDefinition.BOSS_AI_WEBSITE &&
+                        it.secret.username == SharedProviderDefinition.BOSS_AI_USERNAME
                 }
 
             if (candidates.size > 1) {
@@ -564,13 +577,25 @@ class SecretManagerViewModel(
                 return@launch
             }
 
+            // This fresh search may find an organisation entry absent from the current UI
+            // page. Its explicit server decision, not the UI cache or creator id, authorizes
+            // upgrading that existing definition. Legacy/default metadata fails closed.
             val write = candidates.singleOrNull()?.let { existing ->
-                managedProviderUpdate(existing).fold(
+                if (!existing.canManage) {
+                    state = state.copy(
+                        isOperationInProgress = false,
+                        errorMessage = "You cannot manage the existing BOSS AI definition.",
+                    )
+                    return@launch
+                }
+                managedProviderUpdate(existing.secret).fold(
                     onSuccess = { provider.updateSecret(it) },
                     onFailure = { Result.failure(it) },
                 )
             } ?: provider.createSecret(bossAiDefinitionRequest())
 
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (disposed || generation != prepareDefinitionGeneration) return@launch
             write.onSuccess {
                 aiProviderStore?.invalidate()
                 state = state.copy(isOperationInProgress = false, errorMessage = null)
@@ -580,6 +605,12 @@ class SecretManagerViewModel(
                     isOperationInProgress = false,
                     errorMessage = error.message ?: "Could not prepare the BOSS AI definition.",
                 )
+            }
+        }.also { job ->
+            job.invokeOnCompletion {
+                if (!disposed && generation == prepareDefinitionGeneration) {
+                    state = state.copy(isOperationInProgress = false)
+                }
             }
         }
     }
