@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.secretmanager
 
 import ai.rever.boss.plugin.api.SecretDataProvider
 import ai.rever.boss.plugin.api.SecretEntryWithSharingData
+import ai.rever.boss.plugin.api.SecretEntryWithSharingAccessData
 import ai.rever.boss.plugin.logging.BossLogger
 import ai.rever.boss.plugin.logging.LogCategory
 import androidx.compose.ui.platform.ClipboardManager
@@ -10,6 +11,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -79,6 +81,8 @@ class SharedSecretsViewModel(
     val state: StateFlow<SharedSecretsState> = _state.asStateFlow()
 
     private var loadJob: Job? = null
+    // A transport can swallow cancellation and still return a superseded page.
+    private var loadGeneration = 0L
 
     /**
      * Cancelling is not enough on its own, which is why this exists as well as [loadJob].
@@ -133,10 +137,10 @@ class SharedSecretsViewModel(
                 return
             }
 
+        if (!reset && loadJob?.isActive == true) return
+        val generation = ++loadGeneration
         if (reset) {
             loadJob?.cancel()
-        } else if (loadJob?.isActive == true) {
-            return
         }
 
         _state.update {
@@ -160,6 +164,7 @@ class SharedSecretsViewModel(
             scope.launch {
                 var offset = if (reset) 0 else _state.value.rowsScanned
                 var shares = if (reset) emptyList() else _state.value.allShared
+                var access = if (reset) emptyMap() else _state.value.secretAccess
                 var hasMore = true
                 var pages = 0
                 var elapsedMs = 0L
@@ -172,7 +177,9 @@ class SharedSecretsViewModel(
                 // section switch into an unbounded scan; the Load more control takes over.
                 while (true) {
                     val startedAt = System.nanoTime()
-                    val result = provider.getUserSecretsWithSharingInfo(limit = PAGE_SIZE, offset = offset)
+                    val result = provider.getUserSecretsWithSharingAccess(limit = PAGE_SIZE, offset = offset)
+                    kotlin.coroutines.coroutineContext.ensureActive()
+                    if (disposed || generation != loadGeneration) return@launch
                     elapsedMs = elapsedMsSince(startedAt)
 
                     val page =
@@ -180,9 +187,8 @@ class SharedSecretsViewModel(
                             if (error is CancellationException) throw error
                             val message = error.message ?: "Unknown error"
                             logTiming("getUserSecretsWithSharingInfo(offset=$offset)", elapsedMs, message, failed = true)
-                            if (disposed) return@launch
                             _state.update {
-                                it.copy(
+                                if (disposed || generation != loadGeneration) it else it.copy(
                                     isLoading = false,
                                     isLoadingMore = false,
                                     hasLoadedOnce = true,
@@ -197,7 +203,9 @@ class SharedSecretsViewModel(
                     // the server's full accessible set, so counting only shares would re-read
                     // the same page forever.
                     offset += page.data.size
-                    shares = shares + page.data.filter { it.isSharedWithMe() }
+                    val pageShares = page.data.filter { it.secret.isSharedWithMe() }
+                    shares = shares + pageShares.map { it.secret }
+                    access = access + pageShares.associate { it.secret.id to it.toAccessState() }
                     // An empty page ends the scan whatever `hasMore` says - the host derives
                     // that flag from `size >= limit`, but trusting it alone would spin here if
                     // it were ever true for a page with no rows.
@@ -220,12 +228,13 @@ class SharedSecretsViewModel(
                     if (!hasMore || shares.isNotEmpty() || pages >= MAX_AUTO_PAGES) break
                 }
 
-                if (disposed) return@launch
+                if (disposed || generation != loadGeneration) return@launch
                 val settled = shares
                 _state.update {
-                    it.copy(
+                    if (disposed || generation != loadGeneration) it else it.copy(
                         allShared = settled,
                         shared = if (it.searchQuery.isBlank()) settled else settled.filterBy(it.searchQuery),
+                        secretAccess = access,
                         isLoading = false,
                         isLoadingMore = false,
                         hasLoadedOnce = true,
@@ -237,6 +246,15 @@ class SharedSecretsViewModel(
                         hasMore = hasMore,
                         lastLoadDurationMs = elapsedMs,
                     )
+                }
+            }.also { job ->
+                // Completion runs even when a cancelled plugin scope never starts the body.
+                // A replaced load must not clear the new load's busy indicators.
+                job.invokeOnCompletion {
+                    _state.update {
+                        if (disposed || generation != loadGeneration) it else
+                            it.copy(isLoading = false, isLoadingMore = false)
+                    }
                 }
             }
     }
@@ -309,6 +327,7 @@ class SharedSecretsViewModel(
      */
     fun dispose() {
         disposed = true
+        loadGeneration++
         loadJob?.cancel()
         loadJob = null
         // Deliberately does NOT touch clipboardCopyGeneration: bumping it here invalidates the
@@ -322,7 +341,10 @@ class SharedSecretsViewModel(
             it.copy(
                 allShared = emptyList(),
                 shared = emptyList(),
+                secretAccess = emptyMap(),
                 expandedSecretIds = emptySet(),
+                isLoading = false,
+                isLoadingMore = false,
             )
         }
     }
@@ -366,6 +388,7 @@ private fun List<SecretEntryWithSharingData>.filterBy(query: String) =
 data class SharedSecretsState(
     val allShared: List<SecretEntryWithSharingData> = emptyList(),
     val shared: List<SecretEntryWithSharingData> = emptyList(),
+    val secretAccess: Map<String, SecretAccessState> = emptyMap(),
     val isLoading: Boolean = false,
     val isLoadingMore: Boolean = false,
     val hasLoadedOnce: Boolean = false,
@@ -376,3 +399,11 @@ data class SharedSecretsState(
     val hasMore: Boolean = true,
     val lastLoadDurationMs: Long? = null,
 )
+
+private fun SecretEntryWithSharingAccessData.toAccessState() =
+    SecretAccessState(
+        orgId = orgId,
+        orgSlug = orgSlug,
+        isOrgOwned = isOrgOwned,
+        canManage = canManage,
+    )

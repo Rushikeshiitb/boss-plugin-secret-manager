@@ -60,10 +60,9 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo.
-        // plugin.json declares 1.0.92, the release assigned to API PR #59. The adapter implements
-        // the new interface and names its types, so a construction-time LinkageError guard cannot
-        // make an older host safe: method types may resolve later and the host can scan constant-
-        // pool references before registration.
+        // plugin.json requires 1.0.92 for native pricing and the access-aware secret
+        // contract introduced in 1.0.91. Both are referenced directly by this plugin,
+        // so a construction-time LinkageError guard cannot make an older host safe.
         // See AGENTS.md "Linkage containment".
         compileOnly(
             files(

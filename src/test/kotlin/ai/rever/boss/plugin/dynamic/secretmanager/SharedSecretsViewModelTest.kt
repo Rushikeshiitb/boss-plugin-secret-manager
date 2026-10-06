@@ -3,7 +3,9 @@ package ai.rever.boss.plugin.dynamic.secretmanager
 import ai.rever.boss.plugin.api.CreateSecretRequestData
 import ai.rever.boss.plugin.api.PaginatedSecretsData
 import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingData
+import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingAccessData
 import ai.rever.boss.plugin.api.SecretDataProvider
+import ai.rever.boss.plugin.api.SecretEntryWithSharingAccessData
 import ai.rever.boss.plugin.api.SecretEntryWithSharingData
 import ai.rever.boss.plugin.api.SecretShareData
 import ai.rever.boss.plugin.api.ShareSecretRequestData
@@ -12,10 +14,16 @@ import ai.rever.boss.plugin.api.UpdateSecretRequestData
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.runCurrent
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -31,6 +39,154 @@ import kotlin.test.assertTrue
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class SharedSecretsViewModelTest {
+    @Test
+    fun `superseded shared access cannot restore revoked rows after refresh`() = runTest {
+        val row = entry("revoked", "old.example", "read", false)
+        val oldPage = Result.success(PaginatedSecretsWithSharingAccessData(
+            listOf(SecretEntryWithSharingAccessData(
+                secret = row, orgId = "org-old", orgSlug = "old-team", isOrgOwned = true, canManage = false,
+            )), false,
+        ))
+        val provider = SupersededSharingProvider(oldPage)
+        val vm = SharedSecretsViewModel(provider, this)
+        vm.ensureLoaded()
+        runCurrent()
+
+        vm.refresh()
+        runCurrent()
+        assertTrue(vm.state.value.hasLoadedOnce)
+        assertTrue(vm.state.value.allShared.isEmpty())
+        provider.releaseOld.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(vm.state.value.allShared.isEmpty())
+        assertTrue(vm.state.value.secretAccess.isEmpty())
+        assertEquals(null, vm.state.value.errorMessage)
+        assertFalse(vm.state.value.isLoading)
+    }
+
+    @Test
+    fun `a late superseded failure cannot replace refreshed shared state with an error`() = runTest {
+        val provider = SupersededSharingProvider(Result.failure(IllegalStateException("old failure")))
+        val vm = SharedSecretsViewModel(provider, this)
+        vm.ensureLoaded()
+        runCurrent()
+        vm.refresh()
+        runCurrent()
+        provider.releaseOld.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(null, vm.state.value.errorMessage)
+        assertTrue(vm.state.value.hasLoadedOnce)
+        assertFalse(vm.state.value.isLoading)
+    }
+
+    @Test
+    fun `old shared load completion does not clear a replacement load spinner`() = runTest {
+        val provider = SupersededSharingProvider(
+            Result.success(PaginatedSecretsWithSharingAccessData(emptyList(), false)),
+            gateFresh = true,
+        )
+        val vm = SharedSecretsViewModel(provider, this)
+        vm.ensureLoaded()
+        runCurrent()
+        vm.refresh()
+        runCurrent()
+        provider.releaseOld.complete(Unit)
+        runCurrent()
+        assertTrue(vm.state.value.isLoading)
+
+        provider.releaseFresh.complete(Unit)
+        advanceUntilIdle()
+        assertFalse(vm.state.value.isLoading)
+    }
+
+    @Test
+    fun `current provider cancellation clears shared load indicators`() = runTest {
+        val delegate = FakeSharingProvider(emptyList())
+        val provider = object : SecretDataProvider by delegate {
+            override suspend fun getUserSecretsWithSharingAccess(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingAccessData> =
+                Result.failure(CancellationException("cancelled"))
+        }
+        val vm = SharedSecretsViewModel(provider, this)
+        vm.ensureLoaded()
+        advanceUntilIdle()
+        assertFalse(vm.state.value.isLoading)
+        assertFalse(vm.state.value.isLoadingMore)
+    }
+
+    @Test
+    fun `shared load in an already cancelled scope cannot leave a spinner`() = runTest {
+        val job = Job().apply { cancel() }
+        val vm = SharedSecretsViewModel(FakeSharingProvider(emptyList()), CoroutineScope(coroutineContext + job))
+        vm.ensureLoaded()
+        advanceUntilIdle()
+        assertFalse(vm.state.value.isLoading)
+        assertFalse(vm.state.value.isLoadingMore)
+    }
+
+    private class SupersededSharingProvider(
+        private val oldResult: Result<PaginatedSecretsWithSharingAccessData>,
+        private val gateFresh: Boolean = false,
+    ) : SecretDataProvider by FakeSharingProvider(emptyList()) {
+        val releaseOld = CompletableDeferred<Unit>()
+        val releaseFresh = CompletableDeferred<Unit>()
+        private var calls = 0
+
+        override suspend fun getUserSecretsWithSharingAccess(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingAccessData> {
+            if (calls++ == 0) {
+                try {
+                    releaseOld.await()
+                } catch (_: CancellationException) {
+                    withContext(NonCancellable) { releaseOld.await() }
+                }
+                return oldResult
+            }
+            if (gateFresh) releaseFresh.await()
+            return Result.success(PaginatedSecretsWithSharingAccessData(emptyList(), false))
+        }
+    }
+
+    @Test
+    fun `organization ownership survives the shared-secrets load`() =
+        runTest {
+            val shared = entry("org-shared", "billing.example", accessLevel = "read", isOwner = false)
+            val provider =
+                FakeSharingProvider(
+                    all = listOf(shared),
+                    accessOverrides =
+                        mapOf(
+                            shared.id to
+                                SecretEntryWithSharingAccessData(
+                                    secret = shared,
+                                    orgId = "org-17",
+                                    orgSlug = "platform-team",
+                                    isOrgOwned = true,
+                                    canManage = false,
+                                ),
+                        ),
+                )
+            val viewModel = SharedSecretsViewModel(provider, this)
+
+            viewModel.ensureLoaded()
+            advanceUntilIdle()
+
+            assertEquals("platform-team", viewModel.state.value.secretAccess.getValue(shared.id).orgSlug)
+            assertEquals(
+                "PLATFORM-TEAM",
+                sharedSecretOrganizationLabel(viewModel.state.value.secretAccess.getValue(shared.id)),
+            )
+        }
+
+    @Test
+    fun `organization ownership label has a safe fallback and personal rows have none`() {
+        assertEquals(
+            "ORGANIZATION",
+            sharedSecretOrganizationLabel(SecretAccessState(isOrgOwned = true, canManage = false)),
+        )
+        assertEquals(null, sharedSecretOrganizationLabel(SecretAccessState.READ_ONLY))
+    }
+
     @Test
     fun `only secrets actually shared with me appear in the section`() =
         runTest {
@@ -333,12 +489,8 @@ class SharedSecretsViewModelTest {
             // What this pins is the user-visible property: a transient failure does not leave a
             // full-screen error standing over a list that has since loaded.
             //
-            // It does NOT pin the terminal `errorMessage = null` specifically - both entry
-            // points also clear on the way in, so either alone satisfies this. That line
-            // defends a different case: a cancelled load's failure update landing after a fresh
-            // load has already started. Cancellation is cooperative and the writer is the same
-            // coroutine, so a single-threaded test dispatcher cannot stage that interleaving.
-            // Kept as belt and braces, recorded here as unproven rather than proven.
+            // Separate gated regressions cover superseded responses from a transport that
+            // swallows cancellation; this case covers recovery from a completed failure.
             val provider = FakeSharingProvider(listOf(entry("1", "theirs.com", "read", false)), failFirstCall = true)
             val viewModel = SharedSecretsViewModel(provider, this)
 
@@ -475,6 +627,7 @@ class SharedSecretsViewModelTest {
      */
     private class FakeSharingProvider(
         private val all: List<SecretEntryWithSharingData>,
+        private val accessOverrides: Map<String, SecretEntryWithSharingAccessData> = emptyMap(),
         private val failWith: String? = null,
         /** Forces `hasMore`, to reach the shape the host should never send. */
         private val hasMoreOverride: Boolean? = null,
@@ -513,6 +666,21 @@ class SharedSecretsViewModelTest {
                 ),
             )
         }
+
+        override suspend fun getUserSecretsWithSharingAccess(
+            limit: Int,
+            offset: Int,
+        ): Result<PaginatedSecretsWithSharingAccessData> =
+            getUserSecretsWithSharingInfo(limit, offset).map { page ->
+                PaginatedSecretsWithSharingAccessData(
+                    data =
+                        page.data.map { secret ->
+                            accessOverrides[secret.id]
+                                ?: SecretEntryWithSharingAccessData(secret = secret, canManage = false)
+                        },
+                    hasMore = page.hasMore,
+                )
+            }
 
         override suspend fun getUserSecrets(
             limit: Int,
