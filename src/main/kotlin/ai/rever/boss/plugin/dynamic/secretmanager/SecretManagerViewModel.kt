@@ -21,6 +21,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import ai.rever.boss.plugin.dynamic.secretmanager.security.PersonalVaultOwnershipException
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealth
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealthScanner
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultHealthScanException
@@ -401,7 +402,7 @@ class SecretManagerViewModel(
                             state =
                                 state.copy(
                                     isCheckingHealth = false,
-                                    healthError = "Vault health check failed. ${if (error is VaultHealthScanException) error.message else "Try again."}",
+                                    healthError = "Vault health check failed. ${if (error is VaultHealthScanException || error is PersonalVaultOwnershipException) error.message else "Try again."}",
                                 )
                         }
                     }

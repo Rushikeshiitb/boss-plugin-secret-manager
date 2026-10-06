@@ -6,6 +6,8 @@ import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingData
 import ai.rever.boss.plugin.api.SecretDataProvider
 import ai.rever.boss.plugin.api.SecretEntryData
 import ai.rever.boss.plugin.api.SecretEntryWithSharingData
+import ai.rever.boss.plugin.api.SecretEntryWithSharingAccessData
+import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingAccessData
 import ai.rever.boss.plugin.api.SecretShareData
 import ai.rever.boss.plugin.api.ShareSecretRequestData
 import ai.rever.boss.plugin.api.UnshareSecretRequestData
@@ -69,6 +71,16 @@ internal class FakeSecretDataProvider(
                 notes = entry.notes, expirationDate = entry.expirationDate, tags = entry.tags, metadata = entry.metadata,
                 createdAt = entry.createdAt, updatedAt = entry.updatedAt, isOwner = true, accessLevel = "owner",
             )
+        }, page.hasMore)
+    }
+
+    /** Explicit metadata from a compatible host; no permissive legacy defaults. */
+    override suspend fun getUserSecretsWithSharingAccess(
+        limit: Int,
+        offset: Int,
+    ): Result<PaginatedSecretsWithSharingAccessData> = getUserSecretsWithSharingInfo(limit, offset).map { page ->
+        PaginatedSecretsWithSharingAccessData(page.data.map { secret ->
+            SecretEntryWithSharingAccessData(secret = secret, canManage = true)
         }, page.hasMore)
     }
 

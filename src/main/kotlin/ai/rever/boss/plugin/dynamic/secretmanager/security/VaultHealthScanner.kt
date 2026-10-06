@@ -8,8 +8,8 @@ import kotlin.coroutines.coroutineContext
  * Runs [VaultHealth] over the whole vault by paging the provider to exhaustion.
  *
  * Reuse is a property of the entire set, so a health report over a single page
- * silently understates it. This pages `getUserSecretsWithSharingInfo` until `hasMore` is false
- * (only accessLevel = owner is analyzed; organisation entries and shares are excluded). It checks for cancellation between pages, and a failed page throws
+ * silently understates it. This pages `getUserSecretsWithSharingAccess` until `hasMore` is false
+ * (verified personal owner entries only; organisation markers override owner labels). It checks for cancellation between pages, and a failed page throws
  * rather than analysing a partial set, so the caller shows an error instead of a
  * wrong "all clear".
  */
@@ -31,13 +31,13 @@ object VaultHealthScanner {
         var offset = 0
         while (offset < cap) {
             coroutineContext.ensureActive()
-            val page = provider.getUserSecretsWithSharingInfo(limit = minOf(pageSize, cap - offset), offset = offset).getOrThrow()
+            val page = provider.getUserSecretsWithSharingAccess(limit = minOf(pageSize, cap - offset), offset = offset).getOrThrow()
             coroutineContext.ensureActive()
             if (page.data.isEmpty() && page.hasMore) {
                 throw VaultHealthScanException("Vault enumeration returned an empty page before completion")
             }
             if (offset + page.data.size > cap) throw VaultHealthScanException("Vault exceeds the health check limit of $cap entries")
-            page.data.filter { it.accessLevel == "owner" }.forEach {
+            page.data.filter(PersonalVaultOwnership::includes).map { it.secret }.forEach {
                 records.add(VaultHealth.PasswordRecord(it.id, it.website, it.password, it.username))
             }
             if (!page.hasMore || page.data.isEmpty()) break
