@@ -57,7 +57,9 @@ class SecretManagerViewModel(
     /** Opens a provider's key console, same affordance as the AI Providers panel. */
     private val splitViewOperations: SplitViewOperations? = null,
     /** Read-only: decides whether the share dialog offers role targets at all. */
-    private val authDataProvider: AuthDataProvider? = null
+    private val authDataProvider: AuthDataProvider? = null,
+    /** Wall clock for regenerating a TOTP code at the instant of a copy. */
+    private val unixTimeSeconds: () -> Long = { System.currentTimeMillis() / 1000L }
 ) {
     private val logger = BossLogger.forComponent("SecretManager")
 
@@ -723,7 +725,7 @@ class SecretManagerViewModel(
      * applies.
      */
     fun copyTotpCodeToClipboard(secret: SecretEntryData, clipboard: ClipboardManager): Boolean {
-        val copied = TotpCode.reading(secret.metadata)?.code ?: return false
+        val copied = TotpCode.reading(secret.metadata, unixTimeSeconds())?.code ?: return false
         val generation = ++clipboardCopyGeneration
         clipboard.setText(AnnotatedString(copied))
         scope.launch {

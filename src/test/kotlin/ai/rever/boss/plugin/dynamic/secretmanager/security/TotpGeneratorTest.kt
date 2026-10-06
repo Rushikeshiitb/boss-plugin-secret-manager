@@ -104,6 +104,16 @@ class TotpGeneratorTest {
     }
 
     @Test
+    fun `Unicode characters that uppercase to ASCII are rejected`() {
+        // Both used to decode as SSAA after case conversion despite being
+        // outside RFC 4648's alphabet. ASCII lowercase remains accepted.
+        for (input in listOf("ſSAA", "ßAA")) {
+            assertFailsWith<IllegalArgumentException> { TotpGenerator.base32Decode(input) }
+        }
+        assertContentEquals(TotpGenerator.base32Decode("SSAA"), TotpGenerator.base32Decode("ssaa"))
+    }
+
+    @Test
     fun `digits outside 6 to 8 are rejected on both entry points`() {
         fun code(digits: Int) = TotpGenerator.code(sha1Base32, 59L, TotpGenerator.Params(digits = digits))
         assertFailsWith<IllegalArgumentException> { code(5) }

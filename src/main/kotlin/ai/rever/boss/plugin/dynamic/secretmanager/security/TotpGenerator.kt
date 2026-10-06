@@ -160,7 +160,12 @@ object TotpGenerator {
             input
                 .filterNot { it.isWhitespace() || it == '-' }
                 .trimEnd('=')
-                .uppercase(Locale.ROOT)
+        // Check before case conversion: Unicode uppercase can turn non-alphabet
+        // characters such as long s or ligatures into valid ASCII seed characters.
+        require(cleaned.all { it in 'A'..'Z' || it in 'a'..'z' || it in '2'..'7' }) {
+            "invalid Base32 character"
+        }
+        val normalized = cleaned.uppercase(Locale.ROOT)
         if (cleaned.isEmpty()) return ByteArray(0)
         require(cleaned.length % 8 in VALID_TAIL_LENGTHS) { "invalid Base32 length" }
 
@@ -168,7 +173,7 @@ object TotpGenerator {
         var outIndex = 0
         var buffer = 0
         var bitsLeft = 0
-        for (ch in cleaned) {
+        for (ch in normalized) {
             val value = BASE32_ALPHABET.indexOf(ch)
             require(value >= 0) { "invalid Base32 character" }
             buffer = (buffer shl 5) or value

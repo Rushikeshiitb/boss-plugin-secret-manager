@@ -77,6 +77,7 @@ class TotpCodeTest {
         assertNull(TotpCode.reading(metadata(secret = "not-base32!!!")))
         // An impossible Base32 length is malformed too, and must not crash the panel.
         assertNull(TotpCode.reading(metadata(secret = "AAA")))
+        assertNull(TotpCode.reading(metadata(secret = "ſSAA")))
     }
 
     @Test
