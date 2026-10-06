@@ -1419,8 +1419,10 @@ skip rows or analyze/export a partial vault. `sharedWithOrgSlug` alone describes
 a share target and must not exclude a proven personal owner.
 
 The published API's default fallback wraps legacy rows with `canManage = false`;
-it cannot prove ownership. Compatible host transport is pending BossConsole #554.
-Do not invent a released minimum Boss version for that dependency. A complete,
+it cannot prove ownership. BossConsole #554 is merged and its compatible transport
+is published in [BOSS v9.5.41](https://github.com/risa-labs-inc/BossConsole-Releases/releases/tag/v9.5.41),
+which is the manifest's minimum host version. Its matching runtime companions include
+`boss-ipc` 1.5.0 and `plugin-api-ipc` 1.0.0. A complete,
 empty legacy result is safe to report as zero personal passwords; nonempty
 ambiguous owner results fail closed. Advance offsets by raw rows, fail on capped
 or inconsistent scans, and check cancellation after provider returns as well as
