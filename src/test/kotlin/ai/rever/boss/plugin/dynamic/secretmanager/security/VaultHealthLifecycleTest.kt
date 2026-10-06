@@ -59,5 +59,15 @@ class VaultHealthLifecycleTest {
         advanceUntilIdle()
         assertNull(vm.state.healthReport)
         assertFalse(vm.state.isCheckingHealth)
+        assertTrue(vm.state.healthError != null)
+        assertNull(vm.state.errorMessage, "health failure must keep the normal secrets list available")
+        fails = false
+        vm.runVaultHealthCheck()
+        advanceUntilIdle()
+        assertNull(vm.state.healthError)
+        assertTrue(vm.state.healthReport != null)
+        vm.dispose()
+        assertNull(vm.state.healthReport)
+        assertNull(vm.state.healthError)
     }
 }

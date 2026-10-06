@@ -180,6 +180,7 @@ class SecretManagerViewModel(
         state = state.copy(
             secrets = emptyList(),
             healthReport = null,
+            healthError = null,
             isCheckingHealth = false,
             selectedSecret = null,
             secretShares = emptyList(),
@@ -385,7 +386,7 @@ class SecretManagerViewModel(
         if (disposed) return
         val provider = secretDataProvider ?: return
         healthJob?.cancel()
-        state = state.copy(isCheckingHealth = true, healthReport = null, errorMessage = null)
+        state = state.copy(isCheckingHealth = true, healthReport = null, healthError = null)
         healthJob =
             scope.launch {
                 val thisJob = kotlin.coroutines.coroutineContext[Job]
@@ -398,7 +399,7 @@ class SecretManagerViewModel(
                             state =
                                 state.copy(
                                     isCheckingHealth = false,
-                                    errorMessage = "Vault health check failed. ${if (error is VaultHealthScanException) error.message else "Try again."}",
+                                    healthError = "Vault health check failed. ${if (error is VaultHealthScanException) error.message else "Try again."}",
                                 )
                         }
                     }
@@ -1146,6 +1147,7 @@ data class SecretManagerState(
     /** Local vault-health report from the last check, or null if none has run. */
     val healthReport: VaultHealth.Report? = null,
     val isCheckingHealth: Boolean = false,
+    val healthError: String? = null,
     // Sharing-related state
     val showShareDialog: Boolean = false,
     val secretShares: List<SecretShareData> = emptyList(),

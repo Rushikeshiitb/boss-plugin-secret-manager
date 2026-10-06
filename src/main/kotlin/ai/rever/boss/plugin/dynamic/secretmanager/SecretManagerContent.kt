@@ -597,6 +597,12 @@ private fun SecretsSection(
                 modifier = Modifier.padding(bottom = 8.dp)
             )
         }
+        state.healthError?.let { message ->
+            Text(message, color = BossThemeColors.ErrorColor, style = SecretPanelType.meta)
+            TextButton(onClick = { viewModel.runVaultHealthCheck() }) {
+                Text("Retry health check", color = BossThemeColors.AccentColor, style = SecretPanelType.body)
+            }
+        }
         state.healthReport?.let { report ->
             Text(
                 "Personal vault: ${report.reusedPasswordCount} reused passwords, ${report.weakCount} weak " +
