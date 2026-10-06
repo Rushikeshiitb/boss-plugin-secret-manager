@@ -16,7 +16,7 @@ import kotlin.test.assertTrue
 @OptIn(ExperimentalCoroutinesApi::class)
 class TotpClipboardTest {
     @Test
-    fun `copy regenerates at click time across a code rollover`() = runTest {
+    fun `stored app code is regenerated at click time across a rollover`() = runTest {
         var now = 59L
         val viewModel = viewModel(this) { now }
         val clipboard = FakeClipboard()
@@ -41,6 +41,18 @@ class TotpClipboardTest {
         assertEquals("287082", clipboard.getText()?.text)
         advanceTimeBy(2_000)
         assertEquals("", clipboard.getText()?.text)
+    }
+
+    @Test
+    fun `unsupported vault methods do not copy a TOTP code`() = runTest {
+        val viewModel = viewModel(this)
+        val clipboard = FakeClipboard()
+        clipboard.setText(AnnotatedString("shopping list"))
+        for (type in listOf("sms", "email", "hardware", "hotp")) {
+            val entry = secret().let { it.copy(metadata = it.metadata!!.copy(twofaType = type)) }
+            assertFalse(viewModel.copyTotpCodeToClipboard(entry, clipboard))
+            assertEquals("shopping list", clipboard.getText()?.text)
+        }
     }
 
     @Test
@@ -109,7 +121,7 @@ class TotpClipboardTest {
         website = "example.test",
         username = "user",
         password = "test-password",
-        metadata = SecretMetadataData(twofaEnabled = true, twofaType = "totp", twofaSecret = seed),
+        metadata = SecretMetadataData(twofaEnabled = true, twofaType = "app", twofaSecret = seed),
         createdAt = "2026-01-01",
         updatedAt = "2026-01-01",
     )

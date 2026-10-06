@@ -22,7 +22,7 @@ class TotpCodeTest {
 
     private fun metadata(
         enabled: Boolean = true,
-        type: String? = "totp",
+        type: String? = "app",
         secret: String? = rfcSeed,
     ) = SecretMetadataData(
         twofaEnabled = enabled,
@@ -32,7 +32,7 @@ class TotpCodeTest {
     )
 
     @Test
-    fun `a totp entry produces the RFC code with default params`() {
+    fun `a stored app entry produces the RFC code with default params`() {
         val reading = TotpCode.reading(metadata(), unixTimeSeconds = 59L)
         assertNotNull(reading)
         assertEquals("287082", reading.code)
@@ -59,11 +59,13 @@ class TotpCodeTest {
     }
 
     @Test
-    fun `no reading for a null or non-totp type`() {
+    fun `no reading for a null or unsupported type`() {
         assertNull(TotpCode.reading(null))
         assertNull(TotpCode.reading(metadata(type = null)))
-        // hotp is counter-based and cannot be generated from a clock.
-        assertNull(TotpCode.reading(metadata(type = "hotp")))
+        // Other vault methods are not authenticator codes, and HOTP needs a counter.
+        for (type in listOf("sms", "email", "hardware", "hotp", "unknown")) {
+            assertNull(TotpCode.reading(metadata(type = type)))
+        }
     }
 
     @Test
@@ -81,8 +83,10 @@ class TotpCodeTest {
     }
 
     @Test
-    fun `type match is case-insensitive`() {
-        assertNotNull(TotpCode.reading(metadata(type = "TOTP"), 59L))
+    fun `stored app and compatible totp types are case-insensitive`() {
+        for (type in listOf("app", "APP", "totp", "TOTP")) {
+            assertEquals("287082", TotpCode.reading(metadata(type = type), 59L)?.code)
+        }
     }
 
     @Test

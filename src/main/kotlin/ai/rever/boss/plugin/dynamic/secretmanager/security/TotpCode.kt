@@ -23,13 +23,13 @@ data class TotpReading(
  *
  * A stored [SecretMetadataData] carries only a raw Base32 [SecretMetadataData.twofaSecret]
  * and a [SecretMetadataData.twofaType] string, with no algorithm/digits/period, so the RFC
- * defaults (SHA-1, 6 digits, 30 seconds) are used - which is what an authenticator app
- * assumes for a bare secret and what every mainstream issuer emits.
+ * defaults (SHA-1, 6 digits, 30 seconds) are used for a bare secret. The vault stores
+ * authenticator-app metadata as `app`; `totp` is also accepted for compatible callers.
  *
  * A null is returned, never an exception, when the entry is not a usable TOTP secret:
  *
  *  - no metadata, or 2FA is not enabled;
- *  - the type is not `totp` (a `hotp` counter-based seed cannot be generated from a clock,
+ *  - the type is neither `app` nor `totp` (a `hotp` counter-based seed cannot be generated from a clock,
  *    and an unknown type is not assumed to be TOTP);
  *  - the seed is blank; or
  *  - the seed does not decode as Base32. A malformed stored seed must leave the panel with
@@ -37,6 +37,9 @@ data class TotpReading(
  *    swallowed here. The seed is never put in the caught message or logged.
  */
 object TotpCode {
+    // Canonical database type: secret_metadata.valid_twofa_type and the host request
+    // validators use app/sms/email/hardware. Do not require a type the vault cannot store.
+    private const val TYPE_APP = "app"
     private const val TYPE_TOTP = "totp"
 
     fun reading(
@@ -44,7 +47,8 @@ object TotpCode {
         unixTimeSeconds: Long = System.currentTimeMillis() / 1000L,
     ): TotpReading? {
         if (metadata == null || !metadata.twofaEnabled) return null
-        if (!metadata.twofaType.equals(TYPE_TOTP, ignoreCase = true)) return null
+        val type = metadata.twofaType
+        if (!type.equals(TYPE_APP, ignoreCase = true) && !type.equals(TYPE_TOTP, ignoreCase = true)) return null
         val seed = metadata.twofaSecret
         if (seed.isNullOrBlank()) return null
         val params = TotpGenerator.Params()

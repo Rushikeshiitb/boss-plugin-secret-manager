@@ -1405,3 +1405,12 @@ broker answers.
 
 Both timings are constructor parameters for the same reason `minBrokeredRefreshIntervalMs` is: a
 test that waits two minutes is a test nobody runs.
+
+## Stored authenticator codes
+
+The database's `secret_metadata.valid_twofa_type` constraint and the host's secret
+request validators name an authenticator app `app`, not `totp`. `TotpCode` accepts
+`app` and the compatibility label `totp`, while refusing `sms`, `email`, `hardware`,
+unknown types and counter-based `hotp`. Tests must exercise actual `app` metadata
+through both code generation and the clipboard consumer; a `totp`-only fixture can
+pass while every supported database record fails to display a code.
