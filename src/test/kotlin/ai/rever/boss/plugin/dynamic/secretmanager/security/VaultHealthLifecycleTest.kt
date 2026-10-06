@@ -70,4 +70,17 @@ class VaultHealthLifecycleTest {
         assertNull(vm.state.healthReport)
         assertNull(vm.state.healthError)
     }
+    @Test
+    fun `provider cancellation resets checking state while the panel remains open`() = runTest {
+        val fake = FakeSecretDataProvider(emptyList())
+        val provider = object : SecretDataProvider by fake {
+            override suspend fun getUserSecretsWithSharingInfo(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingData> =
+                Result.failure(kotlinx.coroutines.CancellationException("cancelled"))
+        }
+        val vm = SecretManagerViewModel(provider, null, null, this)
+        vm.runVaultHealthCheck()
+        advanceUntilIdle()
+        assertFalse(vm.state.isCheckingHealth)
+    }
+
 }

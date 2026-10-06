@@ -67,6 +67,7 @@ class SecretManagerViewModel(
     private var loadJob: Job? = null
     private var searchJob: Job? = null
     private var healthJob: Job? = null
+    private var healthGeneration = 0L
 
     /**
      * The permission collector, which is the only launch here that never completes.
@@ -385,6 +386,7 @@ class SecretManagerViewModel(
     fun runVaultHealthCheck() {
         if (disposed) return
         val provider = secretDataProvider ?: return
+        val generation = ++healthGeneration
         healthJob?.cancel()
         state = state.copy(isCheckingHealth = true, healthReport = null, healthError = null)
         healthJob =
@@ -403,6 +405,10 @@ class SecretManagerViewModel(
                                 )
                         }
                     }
+            }.also { job ->
+                job.invokeOnCompletion {
+                    if (!disposed && healthGeneration == generation) state = state.copy(isCheckingHealth = false)
+                }
             }
     }
 
