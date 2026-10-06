@@ -1,6 +1,8 @@
 package ai.rever.boss.plugin.dynamic.secretmanager.ai
 
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -97,6 +99,51 @@ class ActiveProviderPrefsTest {
                 "temp file survived the write",
             )
             assertEquals(ProviderRegistry.XAI, prefs.read())
+        }
+
+    @Test
+    fun `publication replaces a target even when the filesystem rejects atomic replacement`() {
+        val dir = Files.createTempDirectory("ai-prefs-replace")
+        val target = dir.resolve("ai_provider_prefs.json")
+        val temp = dir.resolve("pending.tmp")
+        Files.writeString(target, "old")
+        Files.writeString(temp, "complete new record")
+
+        movePreferenceFile(temp, target) { _, destination ->
+            throw FileAlreadyExistsException(destination.toString())
+        }
+
+        assertEquals("complete new record", Files.readString(target))
+        assertFalse(Files.exists(temp))
+    }
+
+    @Test
+    fun `publication falls back when atomic moves are unsupported`() {
+        val dir = Files.createTempDirectory("ai-prefs-no-atomic")
+        val target = dir.resolve("ai_provider_prefs.json")
+        val temp = dir.resolve("pending.tmp")
+        Files.writeString(target, "old")
+        Files.writeString(temp, "complete new record")
+
+        movePreferenceFile(temp, target) { source, destination ->
+            throw AtomicMoveNotSupportedException(source.toString(), destination.toString(), "unsupported")
+        }
+
+        assertEquals("complete new record", Files.readString(target))
+        assertFalse(Files.exists(temp))
+    }
+
+    @Test
+    fun `a failed replacement cleans its temp without deleting the target`() =
+        runTest {
+            val (prefs, dir) = prefsIn()
+            val target = File(dir, "ai_provider_prefs.json").apply { mkdir() }
+            val existing = File(target, "keep").apply { writeText("unchanged") }
+
+            prefs.write(ProviderRegistry.OPENAI)
+
+            assertEquals("unchanged", existing.readText())
+            assertFalse(dir.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
         }
 
     @Test

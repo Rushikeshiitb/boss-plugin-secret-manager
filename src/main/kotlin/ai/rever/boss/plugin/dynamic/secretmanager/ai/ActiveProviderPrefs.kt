@@ -12,7 +12,9 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
@@ -154,11 +156,7 @@ class ActiveProviderPrefs(
                 while (bytes.hasRemaining()) channel.write(bytes)
                 channel.force(true)
             }
-            try {
-                Files.move(temp, target, ATOMIC_MOVE, REPLACE_EXISTING)
-            } catch (_: AtomicMoveNotSupportedException) {
-                Files.move(temp, target, REPLACE_EXISTING)
-            }
+            movePreferenceFile(temp, target)
         } finally {
             Files.deleteIfExists(temp)
         }
@@ -177,5 +175,26 @@ class ActiveProviderPrefs(
         // There is one preference record per BOSS process. Keep its transaction lock at
         // the same lifetime so independently constructed accessors cannot race.
         private val preferenceMutex = Mutex()
+    }
+}
+
+/**
+ * ATOMIC_MOVE ignores REPLACE_EXISTING: a provider may support atomic moves but
+ * reject an existing target. Fall back in that case as well as unsupported moves.
+ * The caller holds the preference mutex throughout either publication path.
+ */
+internal fun movePreferenceFile(
+    temp: Path,
+    target: Path,
+    atomicMove: (Path, Path) -> Unit = { source, destination ->
+        Files.move(source, destination, ATOMIC_MOVE)
+    },
+) {
+    try {
+        atomicMove(temp, target)
+    } catch (_: AtomicMoveNotSupportedException) {
+        Files.move(temp, target, REPLACE_EXISTING)
+    } catch (_: FileAlreadyExistsException) {
+        Files.move(temp, target, REPLACE_EXISTING)
     }
 }
