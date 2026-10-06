@@ -1,11 +1,17 @@
 package ai.rever.boss.plugin.dynamic.secretmanager.security
 
 import ai.rever.boss.plugin.api.CreateSecretRequestData
+import ai.rever.boss.plugin.dynamic.secretmanager.SecretManagerViewModel
+import ai.rever.boss.plugin.dynamic.secretmanager.ai.FakeSecretDataProvider
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runTest
 import kotlin.math.abs
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -77,6 +83,24 @@ class PasswordGeneratorTest {
     }
 
     @Test
+    fun `long password entropy stays finite and impossible policies have no entropy`() {
+        val bits = PasswordGenerator.entropyBits(PasswordGenerator.Options(length = 200))
+        assertTrue(bits.isFinite())
+        assertTrue(bits > 1200.0)
+        assertEquals(0.0, PasswordGenerator.entropyBits(PasswordGenerator.Options(length = 3)))
+    }
+
+    @Test
+    fun `a failing random source cannot silently change the sampler`() {
+        val alwaysLowercase = object : Random() {
+            override fun nextBits(bitCount: Int): Int = 0
+        }
+        assertFailsWith<IllegalStateException> {
+            PasswordGenerator.generate(random = alwaysLowercase)
+        }
+    }
+
+    @Test
     fun `passphrase draws the requested number of words and joins them`() {
         val list = listOf("alpha", "bravo", "charlie", "delta", "echo", "foxtrot")
         val phrase =
@@ -132,9 +156,44 @@ class PasswordGeneratorTest {
     }
 
     @Test
-    fun `a generated password is accepted by the create-secret contract`() {
-        // The create form enables Save only when the password is non-blank, then
-        // submits a CreateSecretRequestData. A generated password must satisfy both.
+    fun `separator checks cover transformed words and separator boundary overlaps`() {
+        assertFailsWith<IllegalArgumentException> {
+            PasswordGenerator.passphrase(
+                listOf("alpha", "bravo"),
+                PasswordGenerator.PassphraseOptions(separator = "A", capitalize = true),
+            )
+        }
+        // Neither word contains "aaa", but ["a", "aa"] and ["aa", "a"]
+        // both produce "aaaaaa" when joined with it.
+        assertFailsWith<IllegalArgumentException> {
+            PasswordGenerator.passphrase(listOf("a", "aa"), PasswordGenerator.PassphraseOptions(separator = "aaa"))
+        }
+    }
+
+    @Test
+    fun `numbered passphrases reserve digits so the original tuple remains recoverable`() {
+        assertFailsWith<IllegalArgumentException> {
+            PasswordGenerator.passphrase(listOf("a", "a1"), PasswordGenerator.PassphraseOptions(includeNumber = true))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            PasswordGenerator.passphrase(
+                listOf("alpha", "bravo"),
+                PasswordGenerator.PassphraseOptions(separator = "1", includeNumber = true),
+            )
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `a generated password reaches the store through the create flow`() = runTest {
+        val store = FakeSecretDataProvider(emptyList())
+        val viewModel = SecretManagerViewModel(
+            secretDataProvider = store,
+            supabaseDataProvider = null,
+            pluginStoreApiKeyProvider = null,
+            scope = this,
+        )
+        viewModel.showCreateDialog()
         val pw = PasswordGenerator.generate(random = Random(11))
         assertTrue(pw.isNotBlank(), "the create form's confirm predicate")
         val request =
@@ -145,6 +204,12 @@ class PasswordGeneratorTest {
                 notes = null,
                 tags = emptyList(),
             )
-        assertEquals(pw, request.password)
+        viewModel.createSecret(request)
+        advanceUntilIdle()
+
+        assertEquals(request, store.created.single())
+        assertFalse(viewModel.state.showCreateDialog)
+        assertFalse(viewModel.state.isOperationInProgress)
+        viewModel.dispose()
     }
 }

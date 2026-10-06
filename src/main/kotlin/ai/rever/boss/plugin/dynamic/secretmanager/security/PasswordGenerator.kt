@@ -42,8 +42,8 @@ object PasswordGenerator {
     /**
      * A rejection-sampling ceiling. For any length >= the number of selected
      * classes the probability of never drawing a valid string in this many tries
-     * is astronomically small; the forced-placement fallback exists only so the
-     * function is guaranteed to terminate, and it too satisfies the policy.
+     * is astronomically small. A failing random source must fail explicitly,
+     * rather than switch to a biased sampler and invalidate the entropy claim.
      */
     private const val MAX_REJECTION_ATTEMPTS = 1000
 
@@ -77,6 +77,8 @@ object PasswordGenerator {
      *
      * @throws IllegalArgumentException if no class is selected, or the length is
      *   too short to hold one character from each selected class.
+     * @throws IllegalStateException if the random source repeatedly fails to draw
+     *   a string satisfying the selected policy.
      */
     fun generate(
         options: Options = Options(),
@@ -93,21 +95,7 @@ object PasswordGenerator {
             val candidate = CharArray(options.length) { all[random.nextInt(all.length)] }
             if (pools.all { pool -> candidate.any { it in pool } }) return String(candidate)
         }
-        return forcedPlacement(pools, all, options.length, random)
-    }
-
-    /** Termination fallback: guarantee one character per class, fill the rest, shuffle so class order does not leak. */
-    private fun forcedPlacement(
-        pools: List<String>,
-        all: String,
-        length: Int,
-        random: Random,
-    ): String {
-        val chars = ArrayList<Char>(length)
-        pools.forEach { pool -> chars.add(pool[random.nextInt(pool.length)]) }
-        repeat(length - pools.size) { chars.add(all[random.nextInt(all.length)]) }
-        chars.shuffle(random)
-        return chars.joinToString("")
+        error("random source could not satisfy the password policy")
     }
 
     /** How a diceware passphrase is shaped. */
@@ -125,14 +113,17 @@ object PasswordGenerator {
      * The wordlist and separator must let every word-tuple map to a distinct,
      * unambiguously splittable string, or the claimed entropy would be an
      * overstatement. So this rejects a wordlist that:
-     * - contains a blank word or a word containing the separator (joining would be
-     *   ambiguous), or
+     * - contains a blank word or a transformed word containing any separator
+     *   character (including across multi-character separator boundaries), or
      * - collapses under capitalisation (`["a", "A"]` both become `"A"`, so distinct
      *   selections would produce the same phrase).
      *
-     * @throws IllegalArgumentException if the wordlist is empty, has duplicates
-     *   (before or after transformation), a word is blank or contains the
-     *   separator, or the word count is not positive.
+     * Numbered phrases additionally reserve trailing digits for the generated
+     * number and disallow digits in the separator, so that removing the number
+     * recovers exactly one original word-tuple.
+     *
+     * @throws IllegalArgumentException if the wordlist or separator is ambiguous,
+     *   or the word count is not positive.
      */
     fun passphrase(
         wordlist: List<String>,
@@ -144,17 +135,21 @@ object PasswordGenerator {
         require(wordlist.size == wordlist.toHashSet().size) { "wordlist must not contain duplicates" }
         require(options.separator.isNotEmpty()) { "separator must not be empty" }
         require(wordlist.none { it.isBlank() }) { "wordlist must not contain a blank word" }
-        require(wordlist.none { it.contains(options.separator) }) {
-            "no word may contain the separator, or joining would be ambiguous"
-        }
         val transformed = wordlist.map { transform(it, options.capitalize) }
         require(transformed.size == transformed.toHashSet().size) {
             "wordlist must stay distinct after capitalisation"
         }
+        require(transformed.none { word -> word.any { it in options.separator } }) {
+            "transformed words must not contain separator characters"
+        }
+        if (options.includeNumber) {
+            require(options.separator.none { it in DIGITS }) { "numbered phrases need a non-digit separator" }
+            require(transformed.none { it.last() in DIGITS }) { "numbered phrases need words without trailing digits" }
+        }
 
         val words =
             MutableList(options.wordCount) {
-                transform(wordlist[random.nextInt(wordlist.size)], options.capitalize)
+                transformed[random.nextInt(transformed.size)]
             }
         if (options.includeNumber) {
             val at = random.nextInt(words.size)
@@ -177,17 +172,18 @@ object PasswordGenerator {
     fun entropyBits(options: Options): Double {
         val classSizes = options.pools().map { it.length }
         val poolSize = classSizes.sum()
-        if (poolSize == 0 || options.length <= 0) return 0.0
-        val valid = validStringCount(classSizes, poolSize, options.length)
-        return if (valid <= 0.0) 0.0 else ln(valid) / LOG2
+        if (poolSize == 0 || options.length < classSizes.size) return 0.0
+        val validFraction = validStringFraction(classSizes, poolSize, options.length)
+        return if (validFraction <= 0.0) 0.0 else
+            (options.length * ln(poolSize.toDouble()) + ln(validFraction)) / LOG2
     }
 
     /**
-     * Count, as a Double (the value is astronomically large), the length-strings
-     * over a [poolSize] alphabet that include at least one character from every
-     * class in [classSizes], via inclusion-exclusion over which classes are absent.
+     * Probability that a uniform length-string over [poolSize] includes every
+     * class, by inclusion-exclusion. Normalising before exponentiation avoids
+     * Infinity minus Infinity for long passwords.
      */
-    private fun validStringCount(
+    private fun validStringFraction(
         classSizes: List<Int>,
         poolSize: Int,
         length: Int,
@@ -204,7 +200,7 @@ object PasswordGenerator {
                 }
             }
             val sign = if (bits % 2 == 0) 1.0 else -1.0
-            total += sign * (poolSize - removed).toDouble().pow(length.toDouble())
+            total += sign * ((poolSize - removed).toDouble() / poolSize).pow(length.toDouble())
         }
         return total
     }
