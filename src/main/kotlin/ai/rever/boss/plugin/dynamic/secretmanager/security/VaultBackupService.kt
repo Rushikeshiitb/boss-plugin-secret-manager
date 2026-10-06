@@ -10,7 +10,7 @@ import kotlin.coroutines.coroutineContext
 /**
  * Exports the whole vault to an encrypted [VaultBackupCodec] blob and restores it.
  *
- * Export pages `getUserSecretsWithSharingInfo` to exhaustion (accessLevel = owner only; organisation entries and shares are excluded) and captures the
+ * Export pages `getUserSecretsWithSharingAccess` to exhaustion (verified personal owner entries only; organisation markers override owner labels) and captures the
  * FULL fidelity of each entry - notes, expiration, tags, and the 2FA metadata
  * including the seed and recovery codes - so the file is a complete, portable copy.
  *
@@ -43,11 +43,11 @@ object VaultBackupService {
         var offset = 0
         while (offset < SCAN_CAP) {
             coroutineContext.ensureActive()
-            val page = provider.getUserSecretsWithSharingInfo(limit = minOf(PAGE_SIZE, SCAN_CAP - offset), offset = offset).getOrThrow()
+            val page = provider.getUserSecretsWithSharingAccess(limit = minOf(PAGE_SIZE, SCAN_CAP - offset), offset = offset).getOrThrow()
             coroutineContext.ensureActive()
             if (page.data.isEmpty() && page.hasMore) throw VaultBackupException("Vault enumeration returned an empty page before completion")
             if (offset + page.data.size > SCAN_CAP) throw VaultBackupException("Vault exceeds the $SCAN_CAP entry limit")
-            page.data.filter { it.accessLevel == "owner" }.forEach { entries.add(it.toBackupEntry()) }
+            page.data.filter(PersonalVaultOwnership::includes).map { it.secret }.forEach { entries.add(it.toBackupEntry()) }
             if (!page.hasMore || page.data.isEmpty()) break
             offset += page.data.size
             if (offset >= SCAN_CAP) throw VaultBackupException("Vault exceeds the $SCAN_CAP entry limit; enumeration is incomplete")
@@ -103,11 +103,11 @@ object VaultBackupService {
         var offset = 0
         while (offset < SCAN_CAP) {
             coroutineContext.ensureActive()
-            val page = provider.getUserSecretsWithSharingInfo(limit = minOf(PAGE_SIZE, SCAN_CAP - offset), offset = offset).getOrThrow()
+            val page = provider.getUserSecretsWithSharingAccess(limit = minOf(PAGE_SIZE, SCAN_CAP - offset), offset = offset).getOrThrow()
             coroutineContext.ensureActive()
             if (page.data.isEmpty() && page.hasMore) throw VaultBackupException("Vault enumeration returned an empty page before completion")
             if (offset + page.data.size > SCAN_CAP) throw VaultBackupException("Vault exceeds the $SCAN_CAP entry limit")
-            page.data.filter { it.accessLevel == "owner" }.forEach { keys.add(it.website to it.username) }
+            page.data.filter(PersonalVaultOwnership::includes).map { it.secret }.forEach { keys.add(it.website to it.username) }
             if (!page.hasMore || page.data.isEmpty()) break
             offset += page.data.size
             if (offset >= SCAN_CAP) throw VaultBackupException("Vault exceeds the $SCAN_CAP entry limit; enumeration is incomplete")

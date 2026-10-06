@@ -1,7 +1,7 @@
 package ai.rever.boss.plugin.dynamic.secretmanager.security
 
 import ai.rever.boss.plugin.api.SecretDataProvider
-import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingData
+import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingAccessData
 import ai.rever.boss.plugin.dynamic.secretmanager.SecretManagerViewModel
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.FakeSecretDataProvider
 import kotlinx.coroutines.CompletableDeferred
@@ -23,10 +23,10 @@ class VaultBackupLifecycleTest {
         val entered = CompletableDeferred<Unit>()
         val fake = FakeSecretDataProvider(emptyList())
         val provider = object : SecretDataProvider by fake {
-            override suspend fun getUserSecretsWithSharingInfo(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingData> {
+            override suspend fun getUserSecretsWithSharingAccess(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingAccessData> {
                 entered.complete(Unit)
                 gate.await()
-                return Result.success(PaginatedSecretsWithSharingData(emptyList(), false))
+                return Result.success(PaginatedSecretsWithSharingAccessData(emptyList(), false))
             }
         }
         val parent = Job()
@@ -84,8 +84,8 @@ class VaultBackupLifecycleTest {
         var fail = true
         val fake = FakeSecretDataProvider(emptyList())
         val provider = object : SecretDataProvider by fake {
-            override suspend fun getUserSecretsWithSharingInfo(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingData> =
-                if (fail) Result.failure(IllegalStateException("offline")) else fake.getUserSecretsWithSharingInfo(limit, offset)
+            override suspend fun getUserSecretsWithSharingAccess(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingAccessData> =
+                if (fail) Result.failure(IllegalStateException("offline")) else fake.getUserSecretsWithSharingAccess(limit, offset)
         }
         val parent = Job()
         val vm = SecretManagerViewModel(provider, null, null, CoroutineScope(coroutineContext + parent))
@@ -113,7 +113,7 @@ class VaultBackupLifecycleTest {
     fun `provider cancellation ends busy state and allows another backup`() = runTest {
         val fake = FakeSecretDataProvider(emptyList())
         val provider = object : SecretDataProvider by fake {
-            override suspend fun getUserSecretsWithSharingInfo(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingData> =
+            override suspend fun getUserSecretsWithSharingAccess(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingAccessData> =
                 Result.failure(kotlinx.coroutines.CancellationException("cancelled"))
         }
         val parent = Job()

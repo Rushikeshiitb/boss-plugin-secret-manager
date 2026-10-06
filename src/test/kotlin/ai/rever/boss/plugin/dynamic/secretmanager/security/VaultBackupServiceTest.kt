@@ -2,8 +2,9 @@ package ai.rever.boss.plugin.dynamic.secretmanager.security
 
 import ai.rever.boss.plugin.api.SecretEntryData
 import ai.rever.boss.plugin.api.SecretEntryWithSharingData
+import ai.rever.boss.plugin.api.SecretEntryWithSharingAccessData
 import ai.rever.boss.plugin.api.SecretDataProvider
-import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingData
+import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingAccessData
 import ai.rever.boss.plugin.api.CreateSecretRequestData
 import kotlinx.coroutines.CancellationException
 import ai.rever.boss.plugin.api.SecretMetadataData
@@ -126,8 +127,8 @@ class VaultBackupServiceTest {
         val blob = VaultBackupCodec.export(listOf(BackupEntry("site", "u", "pw")), passphrase)
         val fake = FakeSecretDataProvider(emptyList())
         val provider = object : SecretDataProvider by fake {
-            override suspend fun getUserSecretsWithSharingInfo(limit: Int, offset: Int) =
-                Result.success(PaginatedSecretsWithSharingData(emptyList(), true))
+            override suspend fun getUserSecretsWithSharingAccess(limit: Int, offset: Int) =
+                Result.success(PaginatedSecretsWithSharingAccessData(emptyList(), true))
         }
         assertFailsWith<VaultBackupException> { VaultBackupService.importVault(blob, passphrase, provider) }
         assertTrue(fake.created.isEmpty())
@@ -151,17 +152,19 @@ class VaultBackupServiceTest {
 
     @Test
     fun `only personal owner source is included even when org creator isOwner is true`() = runTest {
-        val rows = listOf("owner" to true, "org-creator" to true, "org-colleague" to false,
+        val rows = listOf("owner" to true, "org-owner-labelled" to true, "org-creator" to true, "org-colleague" to false,
             "shared" to false, "unknown" to true).map { (label, owner) ->
             SecretEntryWithSharingData(id = label, website = label, username = "user", password = "pw",
                 createdAt = "now", updatedAt = "now", isOwner = owner,
-                accessLevel = when (label) { "owner" -> "owner"; "org-creator", "org-colleague" -> "org";
+                accessLevel = when (label) { "owner", "org-owner-labelled" -> "owner"; "org-creator", "org-colleague" -> "org";
                     "shared" -> "read"; else -> "new-source" })
         }
         val fake = FakeSecretDataProvider(emptyList())
         val provider = object : SecretDataProvider by fake {
-            override suspend fun getUserSecretsWithSharingInfo(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingData> =
-                Result.success(PaginatedSecretsWithSharingData(rows.drop(offset).take(limit), offset + limit < rows.size))
+            override suspend fun getUserSecretsWithSharingAccess(limit: Int, offset: Int): Result<PaginatedSecretsWithSharingAccessData> =
+                Result.success(PaginatedSecretsWithSharingAccessData(rows.drop(offset).take(limit).map { row ->
+                    SecretEntryWithSharingAccessData(row, isOrgOwned = row.website.startsWith("org-"), canManage = true)
+                }, offset + limit < rows.size))
         }
         val blob = VaultBackupService.exportVault(provider, passphrase)
         assertEquals(listOf("owner"), VaultBackupCodec.import(blob, passphrase).map { it.website })
@@ -169,6 +172,36 @@ class VaultBackupServiceTest {
             VaultBackupCodec.export(listOf(BackupEntry("org-creator", "user", "pw")), passphrase),
             passphrase, provider)
         assertEquals(1, restored.imported, "an org entry must not hide a personal restore")
+    }
+
+    @Test
+    fun `published legacy fallback cannot export owner rows without ownership proof`() = runTest {
+        val legacy = LegacySecretDataProvider(FakeSecretDataProvider(listOf(secret("creator", "org-site", "u", "pw"))))
+        assertFailsWith<PersonalVaultOwnershipException> { VaultBackupService.exportVault(legacy, passphrase) }
+    }
+
+    @Test
+    fun `published legacy fallback fails duplicate discovery before creating restore entries`() = runTest {
+        val fake = FakeSecretDataProvider(listOf(secret("creator", "org-site", "u", "pw")))
+        val blob = VaultBackupCodec.export(listOf(BackupEntry("personal", "u", "pw")), passphrase)
+        assertFailsWith<PersonalVaultOwnershipException> {
+            VaultBackupService.importVault(blob, passphrase, LegacySecretDataProvider(fake))
+        }
+        assertTrue(fake.created.isEmpty())
+    }
+
+    @Test
+    fun `raw offsets cross org-only pages before exporting personal credentials`() = runTest {
+        val fake = FakeSecretDataProvider((1..201).map { secret("$it", "site-$it", "u", "pw") })
+        val provider = object : SecretDataProvider by fake {
+            override suspend fun getUserSecretsWithSharingAccess(limit: Int, offset: Int) =
+                fake.getUserSecretsWithSharingAccess(limit, offset).map { page ->
+                    page.copy(data = page.data.map { it.copy(isOrgOwned = it.secret.id != "201") })
+                }
+        }
+        val blob = VaultBackupService.exportVault(provider, passphrase)
+        assertEquals(listOf("site-201"), VaultBackupCodec.import(blob, passphrase).map { it.website })
+        assertEquals(listOf(100 to 0, 100 to 100, 100 to 200), fake.pageRequests)
     }
 
 }

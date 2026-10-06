@@ -24,6 +24,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import ai.rever.boss.plugin.dynamic.secretmanager.security.PersonalVaultOwnershipException
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultBackupService
 import ai.rever.boss.plugin.dynamic.secretmanager.security.VaultBackupFiles
 import java.io.File
@@ -416,7 +417,7 @@ class SecretManagerViewModel(
                 }.onFailure { error ->
                     if (error is CancellationException) return@onFailure
                     if (!disposed) {
-                        state = state.copy(isBackupBusy = false, backupError = "Backup failed. Check the destination file and vault access before trying again.")
+                        state = state.copy(isBackupBusy = false, backupError = if (error is PersonalVaultOwnershipException) error.message else "Backup failed. Check the destination file and vault access before trying again.")
                     }
                 }
             }.also { job ->
@@ -461,7 +462,7 @@ class SecretManagerViewModel(
                 }.onFailure { error ->
                     if (error is CancellationException) return@onFailure
                     if (!disposed) {
-                        state = state.copy(isBackupBusy = false, backupError = "Restore failed. Check the passphrase, backup format and vault access. Some entries may already have been restored.")
+                        state = state.copy(isBackupBusy = false, backupError = if (error is PersonalVaultOwnershipException) error.message else "Restore failed. Check the passphrase, backup format and vault access. Some entries may already have been restored.")
                     }
                 }
             }.also { job ->
