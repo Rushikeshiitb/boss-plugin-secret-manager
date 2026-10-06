@@ -8,7 +8,7 @@ Your credentials, secrets shared with you, Plugin Store API keys and AI provider
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.secretmanager`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.secretmanager.SecretManagerDynamicPlugin`
-- **API Version**: 1.0.89 (`plugin.json` `apiVersion` and `minApiVersion`)
+- **API Version**: 1.0.92 (`plugin.json` `apiVersion` and `minApiVersion`)
 
 ## Essential Commands
 
@@ -272,9 +272,8 @@ the shared tab; both are reverted, and `git diff` on those two lines is empty.
 
 ## Three sections, and the AI one is not owned by the panel
 
-The panel is segmented into **Secrets**, **Shared with me** and **AI** - the last being the same
-`AiProvidersPanel` the host renders at Settings, AI Providers, from one definition rather than a
-second copy. It is there because this plugin owns every AI credential in BOSS while the panel
+The panel is segmented into **Secrets**, **Shared with me** and **AI**. `AiProvidersPanel` also
+remains available through the compatibility settings API for older hosts, from one definition. It is there because this plugin owns every AI credential in BOSS while the panel
 holding them was reachable only through the host's Settings window: two clicks and a different
 window away from the vault the keys are stored in.
 
@@ -300,9 +299,8 @@ after `register()` returns. Do not "simplify" it to a value.
 
 **The panel does not own it and must not dispose it.** Every other ViewModel on
 `SecretManagerComponent` is per panel instance and cancelled in `lifecycle.doOnDestroy`; this one is
-the plugin's single instance, shared with the host's Settings window through
-`LlmProviderSettingsApiImpl`. Disposing it with the sidebar panel would take the host's AI Providers
-section down too.
+the plugin's single instance, serving consumer APIs and compatibility settings through
+`LlmProviderSettingsApiImpl`. Disposing it with the sidebar panel would break those consumers too.
 
 **The tab is absent, not disabled, when there is no ViewModel.** Registration still contains an
 unexpected `LinkageError` so the secrets panel survives a malformed host API, and a tab whose only
@@ -316,9 +314,10 @@ why `gatewayNotice` starts at `NONE` rather than at a "checking" state: a sectio
 "install the gateway" for one frame on every open, for the many users who have it, is a worse lie
 than a notice that appears late for the few who do not.
 
-**Refresh means three things in this section.** `refreshConnections()`, `checkGateway()` and
-`refreshCliEngines()`, because all three can go stale while the panel sits open: a key edited in the
-Secrets section next door, a gateway installed in the Toolbox, a CLI signed into in a terminal.
+**Refresh rereads all setup sources.** `refreshConnections()` refreshes environment variables,
+local Ollama presence, legacy import offers and credentials without closing the editor.
+`checkGateway()` and `refreshCliEngines()` also run, since gateway installation and CLI login can
+change while the panel sits open. Registry and engine health work launches on IO.
 `refreshConnections` had to be added - `ensureConnectionsLoaded` is `compareAndSet(false, true)` and
 loads once per ViewModel, so it is not a refresh.
 
@@ -335,7 +334,7 @@ to discover that one plugin stood in the way.
 gateway serving no engines is a different fact from an absent one. It is ported from
 `user-secret-list`'s `SecretManagerLink` minus the part that does not apply: that plugin's floor is
 1.0.20, so it had to probe reflectively for `openPanel` (api 1.0.57). This plugin's floor is
-**1.0.89**, so `PluginLoaderDelegate`, `PanelEventProvider`, `PanelId` and `openPanel` are all below
+**1.0.92**, so `PluginLoaderDelegate`, `PanelEventProvider`, `PanelId` and `openPanel` are all below
 it and are called straight - a guard there would be dead code implying a risk that cannot occur.
 
 Two rules carried over from that port, both mutation-verified here:
@@ -365,6 +364,62 @@ ignores the field anyway (`missingFor` matches on id alone). This exact trap was
 `user-secret-list` and was invisible in the committed file.
 
 ## AI Providers (`ai/` package)
+
+This plugin owns AI provider configuration **and is now the only place it is edited**. The host's
+`Settings > AI Providers` section is gone, along with the `LlmProviderAPIAccess` singleton that
+served it: the credentials live in this panel's vault, so the page that manages them belongs beside
+them rather than two clicks away in another window. `LlmProviderSettingsAPI` is still registered -
+that is what `PluginContext.llmProvider` relays to other plugins, which is the part they consume.
+
+**The AI-provider secret cards jump into the AI section, not into Settings.** A card's chip used to
+call `SettingsProvider.openSettings(window, "LLM_PROVIDERS")`; it now selects that provider and
+switches the panel's section. `secret.website` holds the provider id, which is what makes it land on
+the right row rather than at the top of the list. `settingsProvider` and `windowId` were removed
+from `SecretManagerViewModel` with it - that jump was their only reader.
+
+Navigation resolves the website first and then known provider tags through the same resolver as
+credential storage. Edited metadata must not send a key into a different provider's form.
+Unknown providers and unavailable AI support show an error in Secrets. The AI scroll state stays
+hoisted alongside the two secret lists so a tab switch does not discard the reader's place.
+
+### The section loads lazily, because `init` is `register()`
+
+`ensureSectionLoaded()` runs the CLI probes and the gateway check on first entry, not from the
+ViewModel's `init`. This object is constructed during `register()`, on **every launch**, for a
+section most launches never open - and `refreshCliEngines()` runs `<engine> --version`, so two
+engines meant two processes spawned during startup to fill in rows nobody had asked to see.
+
+`ensureConnectionsLoaded()` deliberately did **not** move. Other plugins read
+`PluginContext.llmProvider` without this panel ever being opened, so the warm-up stays eager - it
+exists so the first AI action after a restart does not race the load.
+
+Mutation-verified: putting the two calls back in `init` fails *nothing is probed until the section is
+opened*, which counts engine-list reads rather than watching state, so a probe that merely starts
+slowly still fails it. `openingTheSectionTwiceProbesOnce` pins the idempotence the panel relies on,
+since it calls `ensureSectionLoaded()` from a `LaunchedEffect` on every entry.
+
+Consumer discovery still reads the selected CLI id through the gateway registry on IO, without
+enumerating engines or running health probes before choosing an automatic HTTP default. This applies to both managed recommendations and
+configured HTTP providers without an explicit saved selection: consumers must not silently choose
+HTTP while a CLI selection is active. The panel's `activeCliEngineId`
+is populated only on entry now, so trusting it during startup or sign-in recovery would silently
+select BOSS AI over an existing CLI choice. `BossAiDiscoveryTest` covers both paths before panel entry.
+
+### The provider list is an accordion
+
+The selected provider's detail renders **under its own row**, inside the same section. It used to be
+a separate titled section below the whole eight-row list, which was fine in the host's Settings
+window where it was all on screen at once - and wrong in a sidebar one row wide, where tapping the
+fourth provider put the response off the bottom of the panel and the tap read as doing nothing.
+
+Expanding in place removes the duplicate detail title for listed providers. New-provider forms
+retain their title. Clicking an open row closes it and clears its draft, and a placed editor
+requests scrolling into view so a secret-card link can reveal a provider below the fold.
+
+Section descriptions are one short line. `BossSection`'s description is set for the width of the
+Settings window; at sidebar width, two sentences of guidance is three lines of text above content
+that explains itself. Keep the fact a first-time reader cannot infer (a CLI login overrides the
+providers below) and drop the instructions.
 
 ### Automatic BOSS AI discovery
 
@@ -526,10 +581,9 @@ The deployment/definition schema is documented in the host repository at
 `supabase/functions/boss-ai/README.md`. A host release must register the trusted
 broker for legacy shares; automatic BOSS AI uses the plugin-owned ticket flow instead.
 
-This plugin owns **all** AI provider configuration. The host has none: its
-`Settings → AI Providers` section renders `LlmProviderSettingsPanel` through
-`LlmProviderSettingsAPI`, and `PluginContext.llmProvider` is relayed from the same
-registered instance. Provider registry, credentials, environment-variable resolution
+This plugin owns **all** AI provider configuration. Older hosts can render
+`LlmProviderSettingsPanel` through `LlmProviderSettingsAPI`; current hosts use this panel.
+`PluginContext.llmProvider` is relayed from the same registered instance. Provider registry, credentials, environment-variable resolution
 and the model catalogue all live here.
 
 ### Consumer discovery is connection-first and credential-free
@@ -556,6 +610,47 @@ Transient provider failures have their own five-minute retry floor; 401/403 fail
 until the credential changes. `load()` marks discovery started too: invalidating a changed
 credential must never clear a catalog without scheduling its replacement. `catalogsLoaded` drops
 false across that invalidation and becomes true only after the replacement sweep completes.
+
+### Native USD pricing is catalog-derived and freshness-bounded
+
+API PR #59 shipped as v1.0.92 with the pricing types. Both manifest floors are pinned to 1.0.92,
+and hosted CI resolves and tests against that published artifact before this plugin merges.
+
+`LlmModelPricingAPI.modelPricing(providerId, modelId)` exposes only complete rates retained from a
+provider's live model catalog. OpenRouter is the currently verified source: its documented
+`pricing.prompt` and `pricing.completion` USD-per-token strings are converted to USD per million
+tokens, while any present additional charge must be a JSON string representing zero because `AiUsage`
+cannot account for it. Missing, malformed, negative, non-finite or partially representable pricing
+keeps the model usable but returns no rate card. Managed BOSS AI publishes allowances rather than
+verified dollar rates and therefore remains unpriced.
+
+Pricing is available only from a current `CatalogState.Loaded` entry. `Failed.lastKnown` stays
+useful for the picker but never authorizes a budgeted call, and a loaded entry returns null after
+its catalog TTL. A provider must also remain listed under the machine-facing rule, including a
+current credential for keyed providers; a loaded catalog alone does not authorize pricing.
+Provider/model ids match exactly; aliases are never inferred. A catalog timestamp ahead of the
+wall clock fails closed until time catches up or discovery replaces it, even while the picker can
+still show that catalog. Version-two disk
+caches retain verified rates and force old model-only caches through a fresh provider fetch.
+This deliberately discards v1 picker lists on upgrade: an offline user has no cached picker
+until a successful fetch. The version gate rejects stale or unstamped formats and requires new
+provider discovery before the cache can carry verified pricing metadata.
+
+A fresh catalog is not refetched for an unknown model id. A model added upstream after a successful
+fetch can therefore remain unpriced until that provider's catalog TTL expires; this avoids turning
+per-row pricing lookups into provider-discovery host hops.
+
+The auxiliary-charge rule deliberately sacrifices coverage: consumers cannot declare which
+cache, image, audio or search features they use through this pricing contract, so excluding
+those charges from an allegedly complete budget card could undercount spend. On 2026-09-14,
+the public OpenRouter `/api/v1/models` snapshot admitted 127 of 445 models under the numeric-zero
+rule; 277 had nonzero cache-read charges (rejection categories overlap). This is partial coverage,
+not universal OpenRouter pricing. Zero accepts decimal and exponent representations equally.
+Duplicate model ids deliberately yield no pricing rather than choosing an ambiguous card.
+The fetcher's picker deduplication must clear pricing on duplicate ids before choosing the first
+entry; otherwise the API's singleOrNull check never sees the ambiguity. Positive decimal rates
+that underflow to Double zero are unpriced, not free. Coverage counts are logged once per fetch;
+null/numeric auxiliary values still fail closed because they do not explicitly publish a string zero.
 
 ### Legacy plaintext key import
 
@@ -794,14 +889,16 @@ Providers instead get an assisted flow: a "Get API key" button opening
 
 ### Linkage containment
 
-The manifest's declared `apiVersion` floor is **1.0.89** (`plugin.json`, both `apiVersion` and
+The manifest's declared `apiVersion` floor is **1.0.92** (`plugin.json`, both `apiVersion` and
 `minApiVersion`). Check it rather than trusting prose: this section has lagged the manifest twice.
 The registration guard remains a final containment boundary for malformed host installations,
 not a substitute for declaring every type in a public method signature. In particular,
 `AiProviderModels` and `AiAvailableModel` first ship in **v1.0.89**; they occur in
 `availableModels()`'s signature, can resolve after guarded construction, and may be inspected by
-the host's binary validator before registration. That is why the floor moved instead of claiming
-the guard made older hosts safe.
+the host's binary validator before registration. Native pricing additionally names `AiModelPricing`
+and implements `LlmModelPricingAPI` directly, exposing linkage before any method is called.
+Their assigned 1.0.92 release determines the floor (see the release gate above); the construction
+guard does not make older hosts safe.
 
 Earlier audits remain useful evidence. Verified against the api tags:
 `PluginContext.windowId`, `PluginContext.settingsProvider`, `SettingsProvider` and
@@ -834,7 +931,7 @@ The cross-plugin navigation path was checked against **v1.0.73**, not the newest
 `CustomPluginEvent.eventName`/`payload` are all present there and therefore below today's floor.
 
 `BrokerInfo.scopedTo` is also read by `BrokeredCredentialBridge`. Verified against
-the released `v1.0.74` source, it predates the 1.0.89 floor. Scope is looked up live:
+the released `v1.0.74` source, it predates the 1.0.92 floor. Scope is looked up live:
 the current host lists signed-out brokers with `available=false`, but the API does
 not promise every host keeps the same list throughout registration and sign-in.
 
@@ -842,10 +939,15 @@ not promise every host keeps the same list throughout registration and sign-in.
 only files that name the newer AI API types (`LlmProviderSettingsAPI` and
 `LlmApiFormat.GOOGLE_GENERATIVE` from 1.0.71; `BrokeredCredentialProvider`,
 `PluginContext.brokeredCredentialProvider` and `LlmApiFormat.OPENAI_RESPONSES` from 1.0.74;
-`AiCliSessionAPI` and `AiCliHealth` from 1.0.78; model discovery types from 1.0.89).
+`AiCliSessionAPI` and `AiCliHealth` from 1.0.78; model discovery types from 1.0.89; native pricing types assigned to 1.0.92 by API PR #59).
 Everything else uses the plugin-local `WireFormat` enum, the plugin-local `BrokeredKeySource`
 seam, and the plugin-local `CliEngineAccess` seam. Keep the adapter boundary even with the higher
 floor: it limits blast radius when a host API installation is incoherent.
+
+BOSS v9.4.2 `DefaultPlugin.registerPluginAPI` indexes every directly implemented interface.
+`LlmProviderSettingsApiImpl` is therefore registered as both `LlmProviderSettingsAPI` and
+`LlmModelPricingAPI` at the declared host floor; `PluginContext.llmProvider` returns that same
+instance, so consumers may cast it to the pricing companion contract.
 
 `ProviderCredentialStore` is constructed **outside** the guard, which is why it cannot
 hold an api type and gets `brokeredKeys` assigned after the fact. Left null, brokered
@@ -854,7 +956,8 @@ providers report unconfigured - the same answer a host with no broker should giv
 ### Wire formats are direct at the declared API floor
 
 `LlmApiFormat.OPENAI_RESPONSES` once needed reflective resolution because it landed in 1.0.74
-while the plugin admitted 1.0.73 hosts. The 1.0.89 model-discovery signature raised the floor, so
+while the plugin admitted 1.0.73 hosts. Model discovery raised the floor to 1.0.89 and native
+model pricing raised it again to 1.0.92, so
 every enum constant used by `LlmProviderSettingsApiImpl` is now guaranteed and the reflective
 branch became misleading dead compatibility code. Map them directly; a new constant still requires
 checking its release against the manifest before use.
@@ -1138,11 +1241,18 @@ will drift; that file is the only place to change them.
 
 `isEditorOpen` is separate from `selectedProviderId`, and only one of them survives a reload.
 Remembering which provider you were looking at is useful; reopening a transient form nobody asked
-for this time is not — so `load()` sets `isEditorOpen = false` and leaves `selectedProviderId`
-alone.
+for this time is not — so `enterSection()` closes the old editor and keeps the selection. A validated, one-shot
+`requestProviderOnEntry()` command is the exception: it opens that provider on the next entry.
+The shared panel owns this path, including environment refresh, legacy import and a local Ollama
+probe before vault loading; the compatibility host wrapper must not start a second load.
+Entry clears all unsaved drafts on this plugin-owned ViewModel, including a compatibility view
+open in another window. Refresh, including its cold path, preserves the editor and draft.
+Legacy import dismissal lasts for the session and never retires an unimported file.
+Catalog sweep deduplication compares the probed machine snapshot too, so a sweep from before an
+Ollama installation cannot satisfy a later local-setup refresh.
 
 This matters because the ViewModel is the plugin's **single instance**, shared between the sidebar
-AI tab and the host's `Settings → AI Providers` (see "Three sections, and the AI one is not owned
+AI tab, consumer APIs and older hosts' compatibility settings (see "Three sections, and the AI one is not owned
 by the panel"). A per-panel ViewModel would reset the flag for free by being reconstructed; this
 one carries whatever the last visit left, to both surfaces. `ProviderRow`'s
 `isSelected = state.isEditorOpen && …` guard depends on the reset too — without it the stale
@@ -1166,7 +1276,7 @@ rather than failing.
 
 ### Tests
 
-`./gradlew test` - 302 host-independent cases, no live credential needed, run on every
+`./gradlew test` - host-independent cases, no live credential needed, run on every
 pull request by `.github/workflows/test.yml`. The
 model-list parsers are the point: each was written from a provider's published
 reference, and xAI's and Together's envelopes aren't documented at all, so
@@ -1184,8 +1294,8 @@ past the first page, and the cache honouring `invalidate()`. `ModelCatalogClient
 uses a response *queue* rather than one fixed body, which is what makes cursor-following, the
 `MAX_PAGES` bound and the xAI primary-then-fallback path reachable at all.
 
-**Every `AiProvidersViewModel` a test builds must be handed `noOllamaOnThisMachine()`.** `init`
-calls `refreshOllamaSystemInfo()`, so the default `OllamaSystemCheck()` reads the real `PATH`, the
+**Every `AiProvidersViewModel` a test builds must be handed `noOllamaOnThisMachine()`.** Panel entry and
+consumer catalog discovery probe the machine, so the default `OllamaSystemCheck()` reads the real `PATH`, the
 real `user.home` and the real JMX bean - which quietly falsifies `envIn`'s "every source of
 variables is injected" and makes the result depend on whether the machine running the suite
 happens to have Ollama installed. `OllamaSystemCheckTest` has the same rule for

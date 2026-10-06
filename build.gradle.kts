@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.2.26"
+version = "1.2.28"
 
 // Keep the ordinary JAR away from the plugin artifact and the release's build/libs/*.jar glob.
 tasks.jar { destinationDirectory.set(layout.buildDirectory.dir("intermediates/jar")) }
@@ -60,9 +60,9 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo.
-        // plugin.json declares apiVersion and minApiVersion 1.0.91. The core panel directly
-        // references SecretEntryWithAccessData and the access-aware provider methods introduced
-        // there, so a construction-time LinkageError guard cannot make an older host safe.
+        // plugin.json requires 1.0.92 for native pricing and the access-aware secret
+        // contract introduced in 1.0.91. Both are referenced directly by this plugin,
+        // so a construction-time LinkageError guard cannot make an older host safe.
         // See AGENTS.md "Linkage containment".
         compileOnly(
             files(

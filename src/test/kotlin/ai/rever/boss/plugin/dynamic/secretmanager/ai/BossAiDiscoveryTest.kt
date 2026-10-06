@@ -27,6 +27,7 @@ class BossAiDiscoveryTest {
         "brokerId":"boss-ai","baseUrl":"${BossAiCredentialSource.API_SCOPE}","defaultForNewUsers":true}"""
     private val models = """{"data":[{"id":"a","name":"A"},{"id":"z","name":"Z",
         "is_default":true,"max_output_tokens":100,"context_length":2048,"capabilities":["text","tools"],
+        "pricing":{"prompt":"0.000001","completion":"0.000002"},
         "allowance":{"day":{"remaining":10000}}}]}"""
     private val tokenResponse get() = """{"access_token":"ai-only-token","refresh_after_seconds":180,
         "expires_at":"${Instant.now().plusSeconds(300)}"}"""
@@ -74,6 +75,7 @@ class BossAiDiscoveryTest {
             assertEquals(id, config.providerId)
             assertEquals("z", config.modelId)
             assertEquals(100, config.maxTokens)
+            assertNull(api.modelPricing(id, "z"), "managed allowance catalogs do not publish dollar rates")
             assertEquals("Included AI", vm.state.value.providers.first { it.id == id }.displayName)
             assertFalse(vm.state.value.storeAvailable)
             vm.selectModel(id, "a")
@@ -114,6 +116,49 @@ class BossAiDiscoveryTest {
             withTimeout(10_000) { while (api.activeConfig()?.modelId != "z") delay(10) }
             assertEquals(id, api.activeConfig()?.providerId)
         } finally { scope.cancel(); root.deleteRecursively() }
+    }
+
+    @Test fun `automatic discovery respects an existing CLI selection before panel entry`() = runBlocking {
+        for (initiallySignedOut in listOf(false, true)) {
+            val root = Files.createTempDirectory("boss-cli-default").toFile()
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            val rpc = Rpc().also { it.fail = initiallySignedOut }
+            val store = ProviderCredentialStore(FakeSecretDataProvider(emptyList()), env(root),
+                bossAiDiscovery = BossAiDiscovery(QueuedHttpClient(listOf(200 to metadata)))).also {
+                it.brokeredKeys = BossAiCredentialSource(rpc, httpClient = QueuedHttpClient(listOf(200 to tokenResponse)))
+            }
+            val probes = java.util.concurrent.atomic.AtomicInteger()
+            val cli = object : CliEngineAccess {
+                override fun engines(): List<CliEngineInfo> {
+                    probes.incrementAndGet()
+                    return emptyList()
+                }
+                override suspend fun health(engineId: String): CliEngineHealth {
+                    probes.incrementAndGet()
+                    return CliEngineHealth.Unknown
+                }
+                override fun selectedEngineId(): String = "claude"
+                override fun selectEngine(engineId: String?): Boolean = error("Discovery must not change CLI selection")
+            }
+            try {
+                val vm = AiProvidersViewModel(store = store,
+                    catalog = ModelCatalog(ModelCatalogClient(QueuedHttpClient(listOf(200 to models)))),
+                    prefs = ActiveProviderPrefs(root), legacyImport = null, splitViewOperations = null,
+                    scope = scope, envResolver = env(root), cliEngines = cli,
+                    ollamaSystemCheck = noOllamaOnThisMachine())
+                val api = LlmProviderSettingsApiImpl(vm)
+                api.availableModels()
+                withTimeout(10_000) { vm.catalogsLoaded.first { it } }
+                assertNull(vm.state.value.activeProviderId)
+                if (initiallySignedOut) {
+                    rpc.fail = false
+                    vm.refreshConnections().join()
+                    assertTrue(vm.state.value.connectionOf(id).isConfigured)
+                    assertNull(vm.state.value.activeProviderId, "sign-in recovery must preserve the CLI choice")
+                }
+                assertEquals(0, probes.get(), "discovery must not enumerate or probe CLI engines")
+            } finally { scope.cancel(); root.deleteRecursively() }
+        }
     }
 
     @Test fun `provider metadata cannot change broker or escape trusted scope`() = runBlocking {

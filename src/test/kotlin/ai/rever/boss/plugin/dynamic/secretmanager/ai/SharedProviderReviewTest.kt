@@ -221,7 +221,7 @@ class SharedProviderReviewTest {
     @Test fun `shared catalog is never seeded from disk`() = runBlocking {
         val root = Files.createTempDirectory("shared-no-seed").toFile()
         try {
-            File(root, "ai-model-catalog.json").writeText("""{"version":1,"providers":{
+            File(root, "ai-model-catalog.json").writeText("""{"version":2,"providers":{
                 "${descriptor.id}":{"models":[{"id":"private","displayName":"Private"}],"fetchedAtEpochMs":1000}}}""")
             val catalog = ModelCatalog(cacheDir = root)
             catalog.seedFromCache()
@@ -247,9 +247,12 @@ class SharedProviderReviewTest {
             api.activeConfig()
             withTimeout(10_000) { vm.catalogsLoaded.first { it } }
             assertNotNull(api.activeConfig())
+            vm.selectProvider(descriptor.id)
+            assertTrue(vm.state.value.isEditorOpen)
             vault.entries = emptyList()
             vm.refreshConnections()
             withTimeout(10_000) { vm.state.first { state -> state.providers.none { it.id == descriptor.id } } }
+            assertFalse(vm.state.value.isEditorOpen, "a removed share must not open the default provider editor")
             assertNull(vm.state.value.activeProviderId)
             assertNull(api.activeConfig())
             assertEquals(CatalogState.NotConfigured, catalog.stateOf(descriptor.id))
