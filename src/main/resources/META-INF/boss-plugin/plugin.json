@@ -5,7 +5,7 @@
   "version": "0.0.0-unstamped",
   "apiVersion": "1.0.92",
   "minApiVersion": "1.0.92",
-  "minBossVersion": "9.5.14",
+  "minBossVersion": "9.5.41",
   "mainClass": "ai.rever.boss.plugin.dynamic.secretmanager.SecretManagerDynamicPlugin",
   "type": "panel",
   "description": "Your credentials, secrets shared with you, Plugin Store publish keys and AI provider settings",
