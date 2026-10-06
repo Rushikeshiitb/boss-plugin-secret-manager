@@ -5,6 +5,7 @@ import ai.rever.boss.plugin.dynamic.secretmanager.ai.AiProvidersPanel
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.AiProvidersViewModel
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.CredentialSource
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.ProviderRegistry
+import ai.rever.boss.plugin.dynamic.secretmanager.security.PasswordGenerator
 import ai.rever.boss.plugin.scrollbar.getPanelScrollbarConfig
 import ai.rever.boss.plugin.scrollbar.lazyListScrollbar
 import ai.rever.boss.plugin.ui.BossAlertDialog
@@ -506,6 +507,7 @@ private fun SecretManagerView(
         ShareSecretDialog(
             secret = state.selectedSecret,
             shares = state.secretShares,
+            shareTargets = state.secretShareTargets,
             availableUsers = state.availableUsers,
             availableRoles = state.availableRoles,
             canShareWithRoles = state.canShareWithRoles,
@@ -658,6 +660,7 @@ private fun SecretsSection(
                     items(state.secrets, key = { it.id }) { secret ->
                         SecretCard(
                             secret = secret,
+                            access = viewModel.accessFor(secret.id),
                             isPasswordVisible = state.visiblePasswordIds.contains(secret.id),
                             isExpanded = state.expandedSecretIds.contains(secret.id),
                             onTogglePassword = { viewModel.togglePasswordVisibility(secret.id) },
@@ -999,6 +1002,7 @@ private fun EmptyView(
 @Composable
 private fun SecretCard(
     secret: SecretEntryData,
+    access: SecretAccessState,
     isPasswordVisible: Boolean,
     isExpanded: Boolean,
     onTogglePassword: () -> Unit,
@@ -1105,37 +1109,70 @@ private fun SecretCard(
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+                    if (access.isOrgOwned) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.Business,
+                                contentDescription = "Organization-owned secret",
+                                tint = BossThemeColors.AccentColor,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Text(
+                                text = buildString {
+                                    append("Organization")
+                                    access.orgSlug?.takeIf { it.isNotBlank() }?.let { append(" · ").append(it) }
+                                    if (!access.canManage) append(" · Read-only")
+                                },
+                                color = if (access.canManage) BossThemeColors.AccentColor else BossThemeColors.TextSecondary,
+                                style = SecretPanelType.meta,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
                 }
 
                 // The three actions were a hardcoded blue, success-green and error-red, on
                 // every card - a row of traffic lights repeated down the list, none of which
                 // meant anything. Colour here is reserved for the one action that cannot be
                 // undone; Share and Edit are ordinary controls and read as text does.
-                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                    IconButton(onClick = onShare, modifier = Modifier.size(28.dp)) {
-                        Icon(
-                            Icons.Default.Share,
-                            contentDescription = "Share",
-                            tint = BossThemeColors.TextSecondary,
-                            modifier = Modifier.size(16.dp)
-                        )
+                if (access.canManage) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                        IconButton(onClick = onShare, modifier = Modifier.size(28.dp)) {
+                            Icon(
+                                Icons.Default.Share,
+                                contentDescription = "Share",
+                                tint = BossThemeColors.TextSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        IconButton(onClick = onEdit, modifier = Modifier.size(28.dp)) {
+                            Icon(
+                                Icons.Default.Edit,
+                                contentDescription = "Edit",
+                                tint = BossThemeColors.TextSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "Delete",
+                                tint = BossThemeColors.ErrorColor.copy(alpha = 0.75f),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
-                    IconButton(onClick = onEdit, modifier = Modifier.size(28.dp)) {
-                        Icon(
-                            Icons.Default.Edit,
-                            contentDescription = "Edit",
-                            tint = BossThemeColors.TextSecondary,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                    IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
-                        Icon(
-                            Icons.Default.Delete,
-                            contentDescription = "Delete",
-                            tint = BossThemeColors.ErrorColor.copy(alpha = 0.75f),
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
+                } else {
+                    Icon(
+                        Icons.Default.Lock,
+                        contentDescription = "Read-only secret",
+                        tint = BossThemeColors.TextSecondary,
+                        modifier = Modifier.size(16.dp),
+                    )
                 }
             }
 
@@ -1461,6 +1498,20 @@ private fun CreateSecretDialog(
                     onTogglePassword = { showPassword = !showPassword }
                 )
 
+                // Offer a strong replacement rather than making the user invent one.
+                // Not for API keys, which are issued by the service, not chosen here.
+                if (!isApiKey) {
+                    TextButton(
+                        onClick = {
+                            password = PasswordGenerator.generate()
+                            showPassword = true
+                        },
+                        enabled = !isLoading
+                    ) {
+                        Text("Generate strong password", color = BossThemeColors.AccentColor)
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(12.dp))
 
                 DialogTextField(
@@ -1737,6 +1788,7 @@ private fun DeleteConfirmationDialog(
 private fun ShareSecretDialog(
     secret: SecretEntryData,
     shares: List<SecretShareData>,
+    shareTargets: Map<String, SecretShareTargetState>,
     availableUsers: List<ShareUserRow>,
     availableRoles: List<ShareRoleRow>,
     canShareWithRoles: Boolean,
@@ -1797,6 +1849,7 @@ private fun ShareSecretDialog(
                         )
                     } else {
                         shares.forEach { share ->
+                            val presentation = presentShareTarget(share, shareTargets[share.shareId])
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1807,29 +1860,31 @@ private fun ShareSecretDialog(
                             ) {
                                 Column {
                                     Text(
-                                        share.sharedWithUserEmail ?: share.sharedWithRoleName ?: "Unknown",
+                                        presentation.label,
                                         color = BossThemeColors.TextPrimary,
                                         style = SecretPanelType.meta
                                     )
                                     Text(
-                                        if (share.sharedWithUserId != null) "User" else "Role",
+                                        presentation.kind,
                                         color = BossThemeColors.TextSecondary,
                                         style = SecretPanelType.micro
                                     )
                                 }
-                                IconButton(
-                                    onClick = {
-                                        onRevoke(share.sharedWithUserId, share.sharedWithRoleId)
-                                    },
-                                    modifier = Modifier.size(24.dp),
-                                    enabled = !isLoading
-                                ) {
-                                    Icon(
-                                        Icons.Default.Close,
-                                        contentDescription = "Revoke",
-                                        tint = BossThemeColors.ErrorColor,
-                                        modifier = Modifier.size(16.dp)
-                                    )
+                                if (presentation.canRevoke) {
+                                    IconButton(
+                                        onClick = {
+                                            onRevoke(share.sharedWithUserId, share.sharedWithRoleId)
+                                        },
+                                        modifier = Modifier.size(24.dp),
+                                        enabled = !isLoading
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Close,
+                                            contentDescription = "Revoke",
+                                            tint = BossThemeColors.ErrorColor,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
                                 }
                             }
                             Spacer(modifier = Modifier.height(4.dp))
@@ -2034,6 +2089,29 @@ private fun ShareSecretDialog(
         }
     }
 }
+
+/** Complete share-target label without guessing that every non-user target is a role. */
+internal data class ShareTargetPresentation(
+    val label: String,
+    val kind: String,
+    val canRevoke: Boolean,
+)
+
+internal fun presentShareTarget(
+    share: SecretShareData,
+    organization: SecretShareTargetState?,
+): ShareTargetPresentation =
+    when {
+        share.sharedWithUserId != null ->
+            ShareTargetPresentation(share.sharedWithUserEmail ?: requireNotNull(share.sharedWithUserId), "User", true)
+        share.sharedWithRoleId != null ->
+            ShareTargetPresentation(share.sharedWithRoleName ?: requireNotNull(share.sharedWithRoleId), "Role", true)
+        organization?.orgId != null ->
+            // UnshareSecretRequestData has no organisation target yet. Rendering a destructive
+            // button would submit an all-null target and can never revoke the row correctly.
+            ShareTargetPresentation(organization.orgSlug ?: requireNotNull(organization.orgId), "Organization", false)
+        else -> ShareTargetPresentation("Unknown target", "Unknown", false)
+    }
 
 @Composable
 private fun DialogTextField(
