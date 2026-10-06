@@ -2,9 +2,14 @@ package ai.rever.boss.plugin.dynamic.secretmanager.ai
 
 import ai.rever.boss.plugin.api.CreateSecretRequestData
 import ai.rever.boss.plugin.api.PaginatedSecretsData
+import ai.rever.boss.plugin.api.PaginatedSecretsWithAccessData
 import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingData
+import ai.rever.boss.plugin.api.PaginatedSecretsWithSharingAccessData
 import ai.rever.boss.plugin.api.SecretDataProvider
 import ai.rever.boss.plugin.api.SecretEntryData
+import ai.rever.boss.plugin.api.SecretEntryWithAccessData
+import ai.rever.boss.plugin.api.SecretEntryWithSharingData
+import ai.rever.boss.plugin.api.SecretEntryWithSharingAccessData
 import ai.rever.boss.plugin.api.SecretShareData
 import ai.rever.boss.plugin.api.ShareSecretRequestData
 import ai.rever.boss.plugin.api.UnshareSecretRequestData
@@ -40,6 +45,17 @@ internal class FakeSecretDataProvider(
         return Result.success(PaginatedSecretsData(page, hasMore = offset + page.size < entries.size))
     }
 
+    override suspend fun getUserSecretsWithAccess(
+        limit: Int,
+        offset: Int,
+    ): Result<PaginatedSecretsWithAccessData> =
+        getUserSecrets(limit, offset).map { page ->
+            PaginatedSecretsWithAccessData(
+                data = page.data.map { SecretEntryWithAccessData(secret = it, canManage = true) },
+                hasMore = page.hasMore,
+            )
+        }
+
     override suspend fun createSecret(request: CreateSecretRequestData): Result<Unit> {
         if (failWrites) return Result.failure(IllegalStateException("read-only store"))
         created += request
@@ -61,7 +77,25 @@ internal class FakeSecretDataProvider(
     override suspend fun getUserSecretsWithSharingInfo(
         limit: Int,
         offset: Int,
-    ): Result<PaginatedSecretsWithSharingData> = Result.failure(UnsupportedOperationException())
+    ): Result<PaginatedSecretsWithSharingData> = getUserSecrets(limit, offset).map { page ->
+        PaginatedSecretsWithSharingData(page.data.map { entry ->
+            SecretEntryWithSharingData(
+                id = entry.id, website = entry.website, username = entry.username, password = entry.password,
+                notes = entry.notes, expirationDate = entry.expirationDate, tags = entry.tags, metadata = entry.metadata,
+                createdAt = entry.createdAt, updatedAt = entry.updatedAt, isOwner = true, accessLevel = "owner",
+            )
+        }, page.hasMore)
+    }
+
+    /** Explicit metadata from a compatible host; no permissive legacy defaults. */
+    override suspend fun getUserSecretsWithSharingAccess(
+        limit: Int,
+        offset: Int,
+    ): Result<PaginatedSecretsWithSharingAccessData> = getUserSecretsWithSharingInfo(limit, offset).map { page ->
+        PaginatedSecretsWithSharingAccessData(page.data.map { secret ->
+            SecretEntryWithSharingAccessData(secret = secret, canManage = true)
+        }, page.hasMore)
+    }
 
     override suspend fun searchSecrets(
         query: String,
